@@ -1,0 +1,21 @@
+{
+  "recommendations": [
+    "biomejs.biome",
+    "charliermarsh.ruff",
+    "github.vscode-github-actions",
+    "hbenl.vscode-test-explorer",
+    "ms-python.mypy-type-checker",
+    "ms-python.python",
+    "ms-python.vscode-pylance",
+    "ms-vscode.live-server",
+    "redhat.ansible",
+    "redhat.vscode-yaml",
+    "ryanluker.vscode-coverage-gutters",
+    "tombi-toml.tombi",
+    "timonwong.shellcheck"
+  ],
+  "unwantedRecommendations": [
+    "esbenp.prettier-vscode",
+    "tamasfe.even-better-toml"
+  ]
+}

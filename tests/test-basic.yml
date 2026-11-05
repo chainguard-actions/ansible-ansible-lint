@@ -1,0 +1,52 @@
+name: Test basic usage (clean playbook passes)
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Create isolated lint project
+        run: |
+          set -e
+          PROJ="$RUNNER_TEMP/lint-project"
+          rm -rf "$PROJ"
+          mkdir -p "$PROJ"
+          cd "$PROJ"
+          git init -q .
+          cat > playbook.yml <<'EOF'
+          ---
+          - name: Example playbook
+            hosts: localhost
+            gather_facts: false
+            tasks:
+              - name: Print a message
+                ansible.builtin.debug:
+                  msg: Hello
+          EOF
+          cat playbook.yml
+      - id: action
+        uses: .
+        with:
+          override_version: v26.10.0
+          working_directory: ${{ runner.temp }}/lint-project
+          args: playbook.yml
+      - name: Assert action succeeded and ansible-lint is installed
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+        run: |
+          echo "outcome: $OUTCOME"
+          if [ "$OUTCOME" != "success" ]; then
+            echo "FAIL: expected success"
+            exit 1
+          fi
+          if ! command -v ansible-lint >/dev/null 2>&1; then
+            echo "FAIL: ansible-lint not on PATH"
+            exit 1
+          fi
+          ansible-lint --version
+          if [ ! -f "$RUNNER_TEMP/lint-project/.git/ansible-lint-requirements.txt" ]; then
+            echo "FAIL: requirements lock file not downloaded"
+            exit 1
+          fi
+          echo "PASS"

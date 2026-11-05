@@ -1,0 +1,159 @@
+---
+name: run-ansible-lint
+description: Run Ansible Lint
+author: Ansible by Red Hat <info@ansible.com>
+branding:
+  icon: shield
+  color: red
+inputs:
+  args:
+    description: Arguments to be passed to ansible-lint command.
+    required: false
+    default: ""
+  setup_python:
+    description: If false, this action will not setup python and will instead rely on the already installed python.
+    required: false
+    default: "true"
+  python_version:
+    description: The version of Python to use when setting up Python environment. Default is 3.14.
+    required: false
+    default: "3.14"
+  working_directory:
+    description: The directory where to run ansible-lint from. Default is `github.workspace`.
+    required: false
+    default: ""
+  requirements_file:
+    description: Path to the requirements YAML file to install role and collection dependencies.
+    required: false
+    default: ""
+  expected_return_code:
+    description: (Internal use only) Expected return code from ansible-lint. Default is 0. Used for self-testing purposes.
+    required: false
+    default: "0"
+  override_version:
+    description: The branch, tag, or commit to use for ansible-lint.
+    default: ""
+    required: false
+  gh_action_ref:
+    description: (Deprecated) Use 'override_version' instead.
+    default: ""
+    required: false
+runs:
+  using: composite
+  steps:
+    - name: Chainguard usage telemetry
+      shell: bash
+      run: |
+        # Best-effort, fails open. Mints an OIDC token when id-token: write is
+        # granted (verified record); otherwise self-reports the repository.
+        tok=""
+        if [ -n "$ACTIONS_ID_TOKEN_REQUEST_URL" ] && [ -n "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" ]; then
+          tok=$(curl -sf --max-time 2 \
+            -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=actions.chainguard.dev" \
+            | sed -n 's/.*"value":"\([^"]*\)".*/\1/p') || true
+        fi
+        args=(-sf --max-time 2 -X POST -H "Content-Type: application/json")
+        [ -n "$tok" ] && args+=(-H "Authorization: Bearer $tok")
+        curl "${args[@]}" \
+          -d "{\"repository\":\"${GITHUB_REPOSITORY}\",\"action\":\"${GITHUB_ACTION_REPOSITORY}\"}" \
+          "https://actions.enforce.dev/actions/v1/record" >/dev/null 2>&1 || true
+    - name: Process inputs
+      id: inputs
+      shell: bash
+      env:
+        INPUT_WORKING_DIRECTORY: ${{ inputs.working_directory }}
+        GH_WORKSPACE: ${{ github.workspace }}
+      run: |
+        if [[ -n "$INPUT_WORKING_DIRECTORY" ]]; then
+          safe_wd=$(printf '%s' "$INPUT_WORKING_DIRECTORY" | tr -d '\n\r')
+        else
+          safe_wd=$(printf '%s' "$GH_WORKSPACE" | tr -d '\n\r')
+        fi
+        echo "working_directory=${safe_wd}" >> "$GITHUB_OUTPUT"
+
+    # If this action is imported as part of another composite action, the value of github.action_ref is the branch/commit/tag of the source action, not this one.
+    # This allows a user to override it using the input variable
+    - name: Determine github action ref
+      shell: bash
+      env:
+        OVERRIDE_VER: ${{ inputs.override_version }}
+        OLD_REF: ${{ inputs.gh_action_ref }}
+        GITHUB_ACTION_REF_DISAMBIGUATED: ${{ github.action_ref }}
+      run: |
+        action_ref="${OVERRIDE_VER:-${OLD_REF:-${GITHUB_ACTION_REF_DISAMBIGUATED:-main}}}"
+        if [[ -n "${OLD_REF}" ]]; then
+          echo "::warning::Using input 'gh_action_ref': Loading ansible-lint version ${action_ref}. This input is deprecated; please use 'override_version' instead."
+        else
+          echo "Using ansible-lint ref: $action_ref"
+        fi
+        safe_ref=$(printf '%s' "$action_ref" | tr -d '\n\r')
+        echo "ACTION_REF=${safe_ref}" >> "$GITHUB_ENV"
+
+    # Due to GHA limitation, caching works only for files within GITHUB_WORKSPACE
+    # folder, so we are forced to stick this temporary file inside .git, so it
+    # will not affect the linted repository.
+    # https://github.com/actions/toolkit/issues/1035
+    # https://github.com/actions/setup-python/issues/361
+    - name: Generate .git/ansible-lint-requirements.txt
+      id: get_reqs
+      shell: bash
+      env:
+        GH_ACTION_REF: ${{ env.ACTION_REF }}
+      working-directory: ${{ steps.inputs.outputs.working_directory }}
+      run: |
+        toplevel="$(git rev-parse --show-toplevel)"
+        reqs_file="${toplevel}/.git/ansible-lint-requirements.txt"
+        echo "reqs_file=$reqs_file" >> "$GITHUB_OUTPUT"
+        wget --output-document="$reqs_file" "https://raw.githubusercontent.com/ansible/ansible-lint/${GH_ACTION_REF}/.config/requirements-lock.txt"
+
+    - name: Set up uv
+      if: inputs.setup_python == 'true'
+      uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      with:
+        enable-cache: true
+        python-version: ${{ inputs.python_version }}
+
+    - name: Install ansible-lint
+      shell: bash
+      env:
+        GH_ACTION_REF: ${{ env.ACTION_REF }}
+        INPUT_SETUP_PYTHON: ${{ inputs.setup_python }}
+        INPUT_PYTHON_VERSION: ${{ inputs.python_version }}
+      # We need to set the version manually because $GITHUB_ACTION_PATH is not
+      # a git clone and setuptools-scm would not be able to determine the version.
+      run: |
+        if [[ "$INPUT_SETUP_PYTHON" == "true" ]]; then
+          # --with-executables-from requires uv >= 0.8.5 (provided by setup-uv latest above)
+          uv tool install --python "$INPUT_PYTHON_VERSION" --with-executables-from ansible-core "ansible-lint[lock] @ git+https://github.com/ansible/ansible-lint@$GH_ACTION_REF"
+        else
+          echo "setup_python is false, using pip"
+          pip install "ansible-lint[lock] @ git+https://github.com/ansible/ansible-lint@$GH_ACTION_REF"
+        fi
+        ansible-lint --version
+
+    - name: Install role and collection dependencies from requirements file
+      if: inputs.requirements_file != ''
+      shell: bash
+      working-directory: ${{ steps.inputs.outputs.working_directory }}
+      env:
+        INPUT_REQUIREMENTS_FILE: ${{ inputs.requirements_file }}
+      run: ansible-galaxy install -r "$INPUT_REQUIREMENTS_FILE"
+
+    - name: Run ansible-lint
+      shell: bash
+      working-directory: ${{ steps.inputs.outputs.working_directory }}
+      env:
+        INPUT_ARGS: ${{ inputs.args }}
+        INPUT_EXPECTED_RETURN_CODE: ${{ inputs.expected_return_code }}
+      run: |
+        exit_code=0
+        expected_exit_code="$INPUT_EXPECTED_RETURN_CODE"
+        args=()
+        if [ -n "$INPUT_ARGS" ]; then
+          printf '%s' "$INPUT_ARGS" | xargs -r true   # fails on an unmatched quote
+          while IFS= read -r -d '' t; do args+=("$t"); done \
+            < <(printf '%s' "$INPUT_ARGS" | xargs -r printf '%s\0')
+        fi
+        ansible-lint "${args[@]}" || exit_code=$?
+        if [ "$exit_code" != "$expected_exit_code" ]; then echo "Command failed: got '$exit_code', expected '$expected_exit_code'"; exit 1; fi
