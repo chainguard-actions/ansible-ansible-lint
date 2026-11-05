@@ -1,0 +1,30 @@
+name: Test basic lint of clean playbook
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        with:
+          args: "-c tests/fixtures/lint-config.yml tests/fixtures/good/playbook.yml"
+      - name: Assert action succeeded and ansible-lint installed
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+        run: |
+          echo "outcome: $OUTCOME"
+          if [ "$OUTCOME" != "success" ]; then
+            echo "FAIL: expected success"
+            exit 1
+          fi
+          if ! command -v ansible-lint >/dev/null 2>&1 && [ ! -x "$HOME/.local/bin/ansible-lint" ]; then
+            echo "FAIL: ansible-lint not found after install"
+            exit 1
+          fi
+          if [ ! -f "$GITHUB_WORKSPACE/.git/ansible-lint-requirements.txt" ]; then
+            echo "FAIL: requirements lock file not downloaded"
+            exit 1
+          fi
+          echo "PASS"
