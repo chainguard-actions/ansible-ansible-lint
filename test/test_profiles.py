@@ -1,0 +1,101 @@
+"""Tests for the --profile feature."""
+
+import platform
+import subprocess
+import sys
+from pathlib import Path
+
+from _pytest.capture import CaptureFixture
+
+from ansiblelint.rules import RulesCollection, filter_rules_with_profile
+from ansiblelint.rules.risky_shell_pipe import ShellWithoutPipefail
+from ansiblelint.testing import run_ansible_lint
+from ansiblelint.text import strip_ansi_escape
+
+
+def test_profile_min(empty_rule_collection: RulesCollection) -> None:
+    """Asserts our ability to unload rules based on profile."""
+    assert len(empty_rule_collection.rules) == 4, "Unexpected number of implicit rules."
+    # register one extra rule that we know not to be part of "min" profile
+
+    empty_rule_collection.register(ShellWithoutPipefail())
+    assert len(empty_rule_collection.rules) == 5, "Failed to register new rule."
+
+    filter_rules_with_profile(empty_rule_collection.rules, "min")
+    assert len(empty_rule_collection.rules) == 4, (
+        "Failed to unload rule that is not part of 'min' profile."
+    )
+
+
+def test_profile_min_with_enable_list(empty_rule_collection: RulesCollection) -> None:
+    """Asserts that enable_list rules survive profile filtering."""
+    assert len(empty_rule_collection.rules) == 4, "Unexpected number of implicit rules."
+
+    rule = ShellWithoutPipefail()
+    empty_rule_collection.register(rule)
+    assert len(empty_rule_collection.rules) == 5, "Failed to register new rule."
+
+    filter_rules_with_profile(empty_rule_collection.rules, "min", enable_list=[rule.id])
+    assert len(empty_rule_collection.rules) == 5, (
+        "enable_list rule was incorrectly removed by profile filtering."
+    )
+
+
+def test_profile_skip_list(tmp_path: Path) -> None:
+    """Profile-specific skip entries are applied when linting."""
+    (tmp_path / ".ansible-lint").write_text("profile: basic\n", encoding="utf-8")
+    playbook = tmp_path / "playbook.yml"
+    playbook.write_text(
+        "---\n"
+        "- name: Test\n"
+        "  hosts: localhost\n"
+        "  gather_facts: false\n"
+        "  tasks:\n"
+        "    - name: test {{ variable }} task\n"
+        "      ansible.builtin.debug:\n"
+        "        msg: OK\n",
+        encoding="utf-8",
+    )
+
+    result = run_ansible_lint(playbook, cwd=tmp_path)
+
+    assert result.returncode == 0
+    assert "name[casing]" not in result.stdout
+    assert "name[template]" not in result.stdout
+
+
+def test_profile_listing(capfd: CaptureFixture[str]) -> None:
+    """Test that run without arguments it will detect and lint the entire repository."""
+    cmd = [
+        sys.executable,
+        "-m",
+        "ansiblelint",
+        "-P",
+    ]
+    result = subprocess.run(cmd, check=False).returncode
+    assert result == 0
+
+    out, err = capfd.readouterr()
+
+    # Confirmation that it runs in auto-detect mode
+    assert "command-instead-of-module" in out
+    # On WSL we might see this warning on stderr:
+    # [WARNING]: Ansible is being run in a world writable directory
+    # WSL2 has "WSL2" in platform name but WSL1 has "microsoft":
+    platform_name = platform.platform().lower()
+    err_lines = []
+    for line in strip_ansi_escape(err).splitlines():
+        if "SyntaxWarning:" in line:
+            continue
+        if "No know markdown renderer found" in line:
+            continue
+        if (
+            "Skipped installing collection dependencies due to running in offline mode."
+            in line
+        ):
+            continue
+        err_lines.append(line)
+    if all(word not in platform_name for word in ["wsl", "microsoft"]) and err_lines:
+        assert not err_lines, (
+            f"Unexpected stderr output found while running on {platform_name} platform:\n{err_lines}"
+        )

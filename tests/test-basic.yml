@@ -1,0 +1,38 @@
+name: Test basic usage (clean playbook passes)
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        with:
+          override_version: v26.11.0
+          working_directory: tests/fixtures/good
+          args: "-c .ansible-lint playbook.yml"
+      - name: Assert action succeeded and ansible-lint installed
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+        run: |
+          echo "outcome: $OUTCOME"
+          if [ "$OUTCOME" != "success" ]; then
+            echo "FAIL: expected success"
+            exit 1
+          fi
+          export PATH="$HOME/.local/bin:$PATH"
+          if ! command -v ansible-lint >/dev/null 2>&1; then
+            echo "FAIL: ansible-lint not on PATH"
+            exit 1
+          fi
+          ansible-lint --version
+          echo "PASS"
+      - name: Assert requirements lock file was downloaded
+        run: |
+          f="$(git rev-parse --show-toplevel)/.git/ansible-lint-requirements.txt"
+          if [ ! -s "$f" ]; then
+            echo "FAIL: $f missing or empty"
+            exit 1
+          fi
+          echo "PASS"
