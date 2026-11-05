@@ -110,7 +110,7 @@ runs:
 
     - name: Set up uv
       if: inputs.setup_python == 'true'
-      uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      uses: chainguard-actions/astral-sh-setup-uv@74ba10a529c33ee3e7351dfc4da4a46a3bb55954 # v10.0.1
       with:
         enable-cache: true
         python-version: ${{ inputs.python_version }}
