@@ -10,13 +10,13 @@
 
 **Harden Agent Version:** `2`
 
-Action **ansible--ansible-lint/v26.10.0** was hardened automatically. 14 finding(s) were identified and resolved across 2 iteration(s).
+Action **ansible--ansible-lint/v26.10.0** was hardened automatically. 14 finding(s) were identified and resolved across 1 iteration(s).
 
 ## Findings Fixed
 
 ### github-env-injection (severity: high)
 
-Step 'Process inputs' writes `${{ inputs.working_directory }}` (and `${{ github.workspace }}`) straight to $GITHUB_OUTPUT without first running `printf '%s' ... | tr -d '\n\r'`: `echo "working_directory=${{ inputs.working_directory }}" >> $GITHUB_OUTPUT`. A value containing a newline can inject extra outputs.
+Step 'Process inputs' writes untrusted values to $GITHUB_OUTPUT without sanitizing them first: `echo "working_directory=${{ inputs.working_directory }}" >> $GITHUB_OUTPUT` (and `${{ github.workspace }}` on line 51). A newline in the input can inject extra outputs. Fix: pass the value through env and run it through `printf '%s' | tr -d '\n\r'` before the write.
 
 Locations:
 
@@ -25,7 +25,7 @@ Locations:
 
 ### github-env-injection (severity: high)
 
-Step 'Determine github action ref' builds action_ref from the inputs override_version and gh_action_ref (passed in as the OVERRIDE_VER and OLD_REF env vars) and writes it to $GITHUB_ENV without stripping newlines: `echo "ACTION_REF=${action_ref}" >> "$GITHUB_ENV"`. An input containing a newline can set any environment variable for later steps.
+Step 'Determine github action ref' writes action_ref to $GITHUB_ENV without sanitizing it: `echo "ACTION_REF=${action_ref}" >> "$GITHUB_ENV"`. action_ref comes from inputs.override_version, inputs.gh_action_ref and github.action_ref. A newline in it can inject arbitrary environment variables (e.g. LD_PRELOAD, BASH_ENV). Fix: use `printf '%s' "$action_ref" | tr -d '\n\r'` first.
 
 Locations:
 
@@ -33,7 +33,7 @@ Locations:
 
 ### script-injection (severity: high)
 
-Rule (a): step 'Process inputs' puts expressions directly in the run script: `if [[ -n "${{ inputs.working_directory }}" ]]; then`, `echo "working_directory=${{ inputs.working_directory }}" >> $GITHUB_OUTPUT` and `echo "working_directory=${{ github.workspace }}"`.
+Rule (a): step 'Process inputs' puts expressions directly into the run script: `if [[ -n "${{ inputs.working_directory }}" ]]; then`, `echo "working_directory=${{ inputs.working_directory }}"` and `echo "working_directory=${{ github.workspace }}"`.
 
 Locations:
 
@@ -41,7 +41,7 @@ Locations:
 
 ### script-injection (severity: high)
 
-Rule (b): step 'Generate .git/ansible-lint-requirements.txt' expands variables without quotes, including the workflow-controlled $GH_ACTION_REF (from env.ACTION_REF, which comes from inputs) inside a URL: `wget --output-document=$reqs_file https://raw.githubusercontent.com/ansible/ansible-lint/$GH_ACTION_REF/.config/requirements-lock.txt`.
+Rule (b): step 'Generate .git/ansible-lint-requirements.txt' expands variables without quotes: `wget --output-document=$reqs_file https://raw.githubusercontent.com/ansible/ansible-lint/$GH_ACTION_REF/.config/requirements-lock.txt`. GH_ACTION_REF comes from env.ACTION_REF, which is built from inputs, and it is unquoted inside the URL.
 
 Locations:
 
@@ -49,7 +49,7 @@ Locations:
 
 ### script-injection (severity: high)
 
-Rule (a): step 'Install ansible-lint' puts expressions directly in the run script: `if [[ "${{ inputs.setup_python }}" == "true" ]]; then` and `uv tool install --python ${{ inputs.python_version }} --with-executables-from ansible-core ...`.
+Rule (a): step 'Install ansible-lint' puts expressions directly into the run script: `if [[ "${{ inputs.setup_python }}" == "true" ]]; then` and `uv tool install --python ${{ inputs.python_version }} ...`.
 
 Locations:
 
@@ -58,7 +58,7 @@ Locations:
 
 ### script-injection (severity: high)
 
-Rule (a): step 'Install role and collection dependencies from requirements file' puts an expression directly in the run command: `run: ansible-galaxy install -r ${{ inputs.requirements_file }}`.
+Rule (a): step 'Install role and collection dependencies from requirements file' puts an expression directly into the run script: `run: ansible-galaxy install -r ${{ inputs.requirements_file }}`.
 
 Locations:
 
@@ -66,7 +66,7 @@ Locations:
 
 ### script-injection (severity: high)
 
-Rule (a): step 'Run ansible-lint' puts expressions directly in the run script: `expected_exit_code=${{ inputs.expected_return_code }}` and `ansible-lint ${{ inputs.args }} || exit_code=$?`.
+Rule (a): step 'Run ansible-lint' puts expressions directly into the run script: `expected_exit_code=${{ inputs.expected_return_code }}` and `ansible-lint ${{ inputs.args }} || exit_code=$?`.
 
 Locations:
 
@@ -137,23 +137,11 @@ Locations:
 
 **Notes:**
 
-Process inputs: working_directory and github.workspace are now passed through env and have newlines stripped before going to GITHUB_OUTPUT. Determine ref: ACTION_REF has newlines stripped before going to GITHUB_ENV. The wget step's variables and URL are now quoted. Install step: setup_python and python_version come from env, and the python version is quoted. ansible-galaxy now reads requirements_file from env, quoted. Run ansible-lint: expected_return_code comes from env. args is split into an array with the quote-aware xargs method (upstream pasted the expression straight into the script), with an empty-value guard and an unmatched-quote check.
-
-### Iteration 2
-
-**Fixes applied:** script-injection, github-env-injection, invalid-yaml
-
-**Notes:**
-
-I rewrote action.yml as a whole. Nothing has run it yet, and two parts were rebuilt from memory of upstream ansible-lint rather than from the file:
-- The `working-directory: ${{ steps.inputs.outputs.working_directory }}` line on the 'Generate .git/ansible-lint-requirements.txt' step was garbled, so I put that expression back.
-- On 'Install role and collection dependencies from requirements file', I restored the condition `if: inputs.requirements_file != ''` and `shell: bash`. I also added `working-directory: ${{ steps.inputs.outputs.working_directory }}`, which I believe upstream has. The garbled file showed no working-directory there, so check this line against the upstream release.
-
-Changes by step:
-- **Process inputs:** `inputs.working_directory` and `github.workspace` now come in through env. Whichever value is used has newlines and carriage returns stripped (`printf '%s' | tr -d '\n\r'`) and is written to `$GITHUB_OUTPUT` once, quoted.
-- **Generate requirements:** fixed the `working-directory:` key that had been merged into the script, restored `run: |`, and removed the stray unquoted `$GH_ACTION_REF` fragment after the wget URL.
-- **Install ansible-lint:** restored the damaged `run: |` key. The uv command now passes only `--python "$INPUT_PYTHON_VERSION"`; the stray `--withython ${{ inputs.python_version }}` is gone. I dropped the garbled comment lines that contained expressions.
-- **Run ansible-lint:** removed the leftover `expected_exit_code=${{ ... }}` and `ansible-lint ${{ inputs.args }}` lines. Only the array form built from `INPUT_ARGS` with xargs remains, so quotes in `args` are honoured the same way as before.
-
-The parse error at line 106 came from these merged keys, so restoring them fixes the invalid-yaml finding.
+Changes to action.yml:
+- Process inputs: working_directory and github.workspace now come in through env:. The value has newlines stripped (tr -d '\n\r') before it is written to GITHUB_OUTPUT.
+- Determine github action ref: action_ref has newlines stripped before it is written to GITHUB_ENV. The default ref no longer comes from github.action_ref, which is a commit or tag of the mirror. It is now the upstream release v26.10.0, because it decides which ansible-lint gets downloaded from upstream.
+- Generate reqs: reqs_file and the wget URL are quoted, and reqs_file is stripped of newlines before it is written to the output.
+- Install ansible-lint: setup_python and python_version come in through env: and are quoted.
+- requirements_file comes in through env: and is quoted as a single path.
+- Run ansible-lint: expected_return_code and args come in through env:. Upstream pasted args straight into the script, so the shell honoured quotes in it. To keep that, args is split with the quote-aware xargs method into a bash array, with a guard for an empty value, a check that fails on an unmatched quote, and the shell's built-in printf so that '--version' still reaches ansible-lint.
 
