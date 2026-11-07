@@ -79,16 +79,16 @@ runs:
       env:
         OVERRIDE_VER: ${{ inputs.override_version }}
         OLD_REF: ${{ inputs.gh_action_ref }}
-        GITHUB_ACTION_REF_DISAMBIGUATED: ${{ github.action_ref }}
+        GITHUB_ACTION_REF_DISAMBIGUATED: v26.10.1
       run: |
         action_ref="${OVERRIDE_VER:-${OLD_REF:-${GITHUB_ACTION_REF_DISAMBIGUATED:-main}}}"
+        action_ref=$(printf '%s' "$action_ref" | tr -d '\n\r')
         if [[ -n "${OLD_REF}" ]]; then
           echo "::warning::Using input 'gh_action_ref': Loading ansible-lint version ${action_ref}. This input is deprecated; please use 'override_version' instead."
         else
           echo "Using ansible-lint ref: $action_ref"
         fi
-        safe_ref=$(printf '%s' "$action_ref" | tr -d '\n\r')
-        echo "ACTION_REF=${safe_ref}" >> "$GITHUB_ENV"
+        echo "ACTION_REF=${action_ref}" >> "$GITHUB_ENV"
 
     # Due to GHA limitation, caching works only for files within GITHUB_WORKSPACE
     # folder, so we are forced to stick this temporary file inside .git, so it
@@ -102,18 +102,13 @@ runs:
         GH_ACTION_REF: ${{ env.ACTION_REF }}
       working-directory: ${{ steps.inputs.outputs.working_directory }}
       run: |
-        toplevel="$(git rev-parse --show-toplevel)"
-        reqs_file="${toplevel}/.git/ansible-lint-requirements.txt"
-        safe_reqs_file=$(printf '%s' "$reqs_file" | tr -d '\n\r')
-        echo "reqs_file=$safe_reqs_file" >> "$GITHUB_OUTPUT"
+        reqs_file=$(git rev-parse --show-toplevel)/.git/ansible-lint-requirements.txt
+        echo "reqs_file=$reqs_file" >> "$GITHUB_OUTPUT"
         wget --output-document="$reqs_file" "https://raw.githubusercontent.com/ansible/ansible-lint/${GH_ACTION_REF}/.config/requirements-lock.txt"
 
     - name: Set up uv
       if: inputs.setup_python == 'true'
       uses: chainguard-actions/astral-sh-setup-uv@74ba10a529c33ee3e7351dfc4da4a46a3bb55954 # v10.0.1
-      with:
-        enable-cache: true
-        python-version: ${{ inputs.python_version }}
 
     - name: Install ansible-lint
       shell: bash
@@ -145,16 +140,16 @@ runs:
       shell: bash
       working-directory: ${{ steps.inputs.outputs.working_directory }}
       env:
-        INPUT_ARGS: ${{ inputs.args }}
         INPUT_EXPECTED_RETURN_CODE: ${{ inputs.expected_return_code }}
+        INPUT_ARGS: ${{ inputs.args }}
       run: |
         exit_code=0
         expected_exit_code="$INPUT_EXPECTED_RETURN_CODE"
         args=()
         if [ -n "$INPUT_ARGS" ]; then
-          printf '%s' "$INPUT_ARGS" | xargs -r true   # fails on an unmatched quote
+          printf '%s' "$INPUT_ARGS" | xargs -r true >/dev/null
           while IFS= read -r -d '' t; do args+=("$t"); done \
-            < <(printf '%s' "$INPUT_ARGS" | xargs -r printf '%s\0')
+            < <(printf '%s' "$INPUT_ARGS" | xargs -r sh -c 'printf "%s\0" "$@"' sh)
         fi
-        ansible-lint ${args[@]+"${args[@]}"} || exit_code=$?
+        ansible-lint "${args[@]}" || exit_code=$?
         if [ "$exit_code" != "$expected_exit_code" ]; then echo "Command failed: got '$exit_code', expected '$expected_exit_code'"; exit 1; fi

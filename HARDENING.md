@@ -10,22 +10,21 @@
 
 **Harden Agent Version:** `2`
 
-Action **ansible--ansible-lint/v26.10.1** was hardened automatically. 13 finding(s) were identified and resolved across 2 iteration(s).
+Action **ansible--ansible-lint/v26.10.1** was hardened automatically. 14 finding(s) were identified and resolved across 2 iteration(s).
 
 ## Findings Fixed
 
 ### github-env-injection (severity: high)
 
-Step 'Process inputs' writes `${{ inputs.working_directory }}` and `${{ github.workspace }}` straight to $GITHUB_OUTPUT with no `printf '%s' ... | tr -d '\n\r'` cleanup first: `echo "working_directory=${{ inputs.working_directory }}" >> $GITHUB_OUTPUT`. A newline in the input could add extra outputs.
+Step 'Process inputs' writes ${{ inputs.working_directory }} (and ${{ github.workspace }}) straight to $GITHUB_OUTPUT with no printf '%s' | tr -d '\n\r' cleanup first: `echo "working_directory=${{ inputs.working_directory }}" >> $GITHUB_OUTPUT`. A newline in the value can inject extra outputs.
 
 Locations:
 
 - `action.yml:49`
-- `action.yml:51`
 
 ### github-env-injection (severity: high)
 
-Step 'Determine github action ref' builds action_ref from inputs.override_version, inputs.gh_action_ref and github.action_ref (passed in through env vars), then writes it to $GITHUB_ENV without stripping newlines: `echo "ACTION_REF=${action_ref}" >> "$GITHUB_ENV"`. A newline in either input could set any environment variable for later steps.
+Step 'Determine github action ref' builds action_ref from inputs.override_version, inputs.gh_action_ref or github.action_ref (passed in through env) and writes it with `echo "ACTION_REF=${action_ref}" >> "$GITHUB_ENV"`. Newlines are not stripped first, so arbitrary environment variables can be injected.
 
 Locations:
 
@@ -33,7 +32,7 @@ Locations:
 
 ### script-injection (severity: high)
 
-Step 'Process inputs' breaks rule (a): it puts expressions directly in the script with `if [[ -n "${{ inputs.working_directory }}" ]]; then` and `echo "working_directory=${{ inputs.working_directory }}"` / `${{ github.workspace }}`.
+Step 'Process inputs' breaks rule (a): an expression is put straight into the script: `if [[ -n "${{ inputs.working_directory }}" ]]; then echo "working_directory=${{ inputs.working_directory }}" ...` and `echo "working_directory=${{ github.workspace }}"`.
 
 Locations:
 
@@ -41,7 +40,7 @@ Locations:
 
 ### script-injection (severity: high)
 
-Step 'Generate .git/ansible-lint-requirements.txt' breaks rule (b): GH_ACTION_REF comes from inputs through env.ACTION_REF and is expanded without quotes in the URL. `wget --output-document=$reqs_file https://raw.githubusercontent.com/ansible/ansible-lint/$GH_ACTION_REF/.config/requirements-lock.txt`
+Step 'Generate .git/ansible-lint-requirements.txt' breaks rule (b): the untrusted GH_ACTION_REF (from inputs or github.action_ref) is expanded without quotes: `wget --output-document=$reqs_file https://raw.githubusercontent.com/ansible/ansible-lint/$GH_ACTION_REF/.config/requirements-lock.txt`.
 
 Locations:
 
@@ -49,7 +48,7 @@ Locations:
 
 ### script-injection (severity: high)
 
-Step 'Install ansible-lint' breaks rule (a): it puts expressions directly in the script with `if [[ "${{ inputs.setup_python }}" == "true" ]]` and `uv tool install --python ${{ inputs.python_version }} ...`.
+Step 'Install ansible-lint' breaks rule (a): `if [[ "${{ inputs.setup_python }}" == "true" ]]` and `uv tool install --python ${{ inputs.python_version }} ...` put expressions straight into the script.
 
 Locations:
 
@@ -58,11 +57,18 @@ Locations:
 
 ### script-injection (severity: high)
 
-Steps 'Install role and collection dependencies' and 'Run ansible-lint' break rule (a): `run: ansible-galaxy install -r ${{ inputs.requirements_file }}`, `expected_exit_code=${{ inputs.expected_return_code }}` and `ansible-lint ${{ inputs.args }} || exit_code=$?`.
+Step 'Install role and collection dependencies' breaks rule (a): `run: ansible-galaxy install -r ${{ inputs.requirements_file }}`.
 
 Locations:
 
 - `action.yml:116`
+
+### script-injection (severity: high)
+
+Step 'Run ansible-lint' breaks rule (a): `expected_exit_code=${{ inputs.expected_return_code }}` and `ansible-lint ${{ inputs.args }} || exit_code=$?` put expressions straight into the script.
+
+Locations:
+
 - `action.yml:123`
 - `action.yml:124`
 
@@ -130,13 +136,19 @@ Locations:
 
 **Notes:**
 
-All changes are in action.yml. Process inputs: working_directory and github.workspace are now passed in through env:, newlines are stripped, and the result is written once to "$GITHUB_OUTPUT". Determine github action ref: action_ref has newlines stripped before it is written to GITHUB_ENV. Generate reqs: the wget output path and URL are now quoted. Install ansible-lint: setup_python and python_version are passed in through env: and the version is quoted. ansible-galaxy: requirements_file is passed in through env: and quoted. Run ansible-lint: expected_return_code and args are passed in through env:. Upstream pasted args straight into the script, so the shell honored quotes in it. args is now split into a bash array with xargs, which honors quotes the same way. This split has an empty-value guard, an unmatched-quote check and xargs -r. No other behaviour changed. Nothing was run or tested.
+All changes are in action.yml:
+- **Process inputs:** working_directory and github.workspace now come in through env:. Newlines are stripped before the value is written to GITHUB_OUTPUT.
+- **Determine ref:** newlines are stripped from action_ref before it is written to GITHUB_ENV. github.action_ref would name a commit of the mirror, not of ansible/ansible-lint, so the fallback ref used to fetch upstream code is now the literal upstream_ref v26.10.1. override_version and gh_action_ref still take precedence over it.
+- **wget step:** the output file and the URL are now quoted.
+- **Install step:** setup_python and python_version moved to env:, and python_version is quoted. I also removed two old comment lines that contained github.action_ref expressions.
+- **Galaxy step:** requirements_file moved to env: and is quoted.
+- **Run step:** expected_return_code and args moved to env:. Upstream pasted args straight into the script, so the shell honoured quotes in it. To keep that, args is split with the quote-aware xargs form: a check that fails on an unmatched quote, then the shell's built-in printf run through sh -c, so a lone --version still reaches ansible-lint. An empty args passes no arguments.
 
 ### Iteration 2
 
-**Fixes applied:** script-injection, github-env-injection, invalid-yaml
+**Fixes applied:** script-injection, invalid-yaml
 
 **Notes:**
 
-Rebuilt the damaged 'Generate .git/ansible-lint-requirements.txt' and 'Install ansible-lint' steps. Generate step: put the working-directory key back, set reqs_file from git rev-parse --show-toplevel, stripped newlines before writing it to GITHUB_OUTPUT, and quoted the wget arguments. Removed the stray 'PUT' and the repeated lines. Install ansible-lint: setup_python and python_version now come in through env, and the two half-written uv lines are now one. Galaxy step: requirements_file now comes in through env and is quoted. Run ansible-lint: expected_return_code and args now come in through env. args is split into a bash array the same quote-aware way upstream's pasted-in expression was split (xargs, an unmatched-quote check, and an -n guard). The ${{ }} expressions in YAML comments were removed. Small edits kept coming out garbled, so the whole file was rewritten once and read back to check it. I didn't parse it with a YAML tool or run the action. Its run steps are now ordinary block scalars with no stray text.
+Rebuilt the damaged 'Set up uv' step. It is now a plain astral-sh/setup-uv step, still pinned to its SHA, and a separate 'Install ansible-lint' run step follows it. The new step uses shell: bash and an env: block holding GH_ACTION_REF, INPUT_SETUP_PYTHON and INPUT_PYTHON_VERSION. I removed the duplicated broken uv line and replaced the inline ${{ inputs.python_version }} with "$INPUT_PYTHON_VERSION". The broken edit had removed whatever setup-uv originally had under with:, so I left with: off. uv gets the Python version directly through --python.
 
