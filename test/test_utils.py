@@ -1,0 +1,1478 @@
+# Copyright (c) 2013-2014 Will Thames <will@thames.id.au>
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
+"""Tests for generic utility functions."""
+
+from __future__ import annotations
+
+import copy
+import logging
+import subprocess
+import sys
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+import pytest
+from ansible.utils.sentinel import Sentinel
+from packaging.version import Version
+
+from ansiblelint import cli, constants, utils
+from ansiblelint.__main__ import initialize_logger
+from ansiblelint.cli import get_rules_dirs
+from ansiblelint.config import get_deps_versions
+from ansiblelint.constants import RC
+from ansiblelint.file_utils import Lintable, cwd
+from ansiblelint.runner import Runner
+from ansiblelint.testing import run_ansible_lint
+from ansiblelint.types import (  # pyright: ignore[reportAttributeAccessIssue]
+    AnsibleMapping,  # pyright: ignore[reportAttributeAccessIssue]
+    AnsibleSequence,  # pyright: ignore[reportAttributeAccessIssue]
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from _pytest.capture import CaptureFixture
+    from _pytest.logging import LogCaptureFixture
+    from _pytest.monkeypatch import MonkeyPatch
+
+    from ansiblelint.rules import RulesCollection
+
+
+@pytest.mark.parametrize(
+    ("string", "expected_args", "expected_kwargs"),
+    (
+        pytest.param("", [], {}, id="a"),
+        pytest.param("a=1", [], {"a": "1"}, id="b"),
+        pytest.param("hello a=1", ["hello"], {"a": "1"}, id="c"),
+        pytest.param(
+            "whatever bobbins x=y z=x c=3",
+            ["whatever", "bobbins"],
+            {"x": "y", "z": "x", "c": "3"},
+            id="more_than_one_arg",
+        ),
+        pytest.param(
+            "command chdir=wxy creates=zyx tar xzf zyx.tgz",
+            ["command", "tar", "xzf", "zyx.tgz"],
+            {"chdir": "wxy", "creates": "zyx"},
+            id="command_with_args",
+        ),
+        pytest.param(
+            "{{ varset }}.yml",
+            ["{{ varset }}.yml"],
+            {},
+            id="x",
+        ),
+        pytest.param(
+            "foo bar.yml",
+            ["foo bar.yml"],
+            {},
+            id="path-with-spaces",
+        ),
+    ),
+)
+def test_tokenize(
+    string: str,
+    expected_args: Sequence[str],
+    expected_kwargs: dict[str, Any],
+) -> None:
+    """Test that tokenize works for different input types."""
+    (args, kwargs) = utils.tokenize(string)
+    assert args == expected_args
+    assert kwargs == expected_kwargs
+
+
+@pytest.mark.parametrize(
+    ("reference_form", "alternate_forms"),
+    (
+        pytest.param(
+            {"name": "hello", "action": "command chdir=abc echo hello world"},
+            ({"name": "hello", "command": "chdir=abc echo hello world"},),
+            id="simple_command",
+        ),
+        pytest.param(
+            {"git": {"version": "abc"}, "args": {"repo": "blah", "dest": "xyz"}},
+            (
+                {"git": {"version": "abc", "repo": "blah", "dest": "xyz"}},
+                {"git": "version=abc repo=blah dest=xyz"},
+                {
+                    "git": None,
+                    "args": {"repo": "blah", "dest": "xyz", "version": "abc"},
+                },
+            ),
+            id="args",
+        ),
+    ),
+)
+def test_normalize(
+    reference_form: dict[str, Any],
+    alternate_forms: tuple[dict[str, Any]],
+) -> None:
+    """Test that tasks specified differently are normalized same way."""
+    task = utils.Task(reference_form, filename="tasks.yml")
+    normal_form = task._normalize_task()  # ruff:ignore[private-member-access]
+
+    for form in alternate_forms:
+        task2 = utils.Task(form, filename="tasks.yml")
+        assert normal_form == task2._normalize_task()  # ruff:ignore[private-member-access]
+
+
+def test_normalize_complex_command() -> None:
+    """Test that tasks specified differently are normalized same way."""
+    task1 = utils.Task(
+        {
+            "name": "hello",
+            "action": {"module": "pip", "name": "df", "editable": "false"},
+        },
+        filename="tasks.yml",
+    )
+    task2 = utils.Task(
+        {"name": "hello", "pip": {"name": "df", "editable": "false"}},
+        filename="tasks.yml",
+    )
+    task3 = utils.Task(
+        {"name": "hello", "pip": "name=df editable=false"},
+        filename="tasks.yml",
+    )
+    task4 = utils.Task(
+        {"name": "hello", "action": "pip name=df editable=false"},
+        filename="tasks.yml",
+    )
+    assert task1._normalize_task() == task2._normalize_task()  # ruff:ignore[private-member-access]
+    assert task2._normalize_task() == task3._normalize_task()  # ruff:ignore[private-member-access]
+    assert task3._normalize_task() == task4._normalize_task()  # ruff:ignore[private-member-access]
+
+
+@pytest.mark.parametrize(
+    ("task_raw", "expected_form"),
+    (
+        pytest.param(
+            {
+                "name": "ensure apache is at the latest version",
+                "yum": {"name": "httpd", "state": "latest"},
+            },
+            {
+                "delegate_to": Sentinel,
+                "name": "ensure apache is at the latest version",
+                "action": {
+                    "__ansible_module__": "yum",
+                    "__ansible_module_original__": "yum",
+                    "name": "httpd",
+                    "state": "latest",
+                },
+            },
+            id="0",
+        ),
+        pytest.param(
+            {
+                "name": "Attempt and graceful roll back",
+                "block": [
+                    {
+                        "name": "Install httpd and memcached",
+                        "ansible.builtin.yum": ["httpd", "memcached"],
+                        "state": "present",
+                    },
+                ],
+            },
+            {
+                "name": "Attempt and graceful roll back",
+                "block": [
+                    {
+                        "name": "Install httpd and memcached",
+                        "ansible.builtin.yum": ["httpd", "memcached"],
+                        "state": "present",
+                    },
+                ],
+                "action": {
+                    "__ansible_module__": "block/always/rescue",
+                    "__ansible_module_original__": "block/always/rescue",
+                },
+            },
+            id="1",
+        ),
+    ),
+)
+def test_normalize_task_v2(
+    task_raw: dict[str, Any],
+    expected_form: dict[str, Any],
+) -> None:
+    """Check that it normalizes task and returns the expected form."""
+    task = utils.Task(task_raw)
+    assert utils.normalize_task_v2(task) == expected_form
+
+
+def test_extract_from_list() -> None:
+    """Check that tasks get extracted from blocks if present."""
+    block = {
+        "block": [{"tasks": {"name": "hello", "command": "whoami"}}],
+        "test_none": None,
+        "test_string": "foo",
+    }
+    blocks = AnsibleSequence([block])
+
+    test_list = utils.extract_from_list(blocks, ["block"])
+    test_none = utils.extract_from_list(blocks, ["test_none"])
+
+    assert list(block["block"]) == test_list  # type: ignore[arg-type]
+    assert not test_none
+    with pytest.raises(RuntimeError):
+        utils.extract_from_list(blocks, ["test_string"])
+
+
+def test_extract_from_list_recursive() -> None:
+    """Check that tasks get extracted from blocks if present."""
+    block = AnsibleMapping({
+        "block": [{"block": [{"name": "hello", "command": "whoami"}]}],
+    })
+    blocks = AnsibleSequence([block])
+
+    test_list = utils.extract_from_list(blocks, ["block"])
+    assert list(block["block"]) == test_list
+
+    test_list_recursive = utils.extract_from_list(blocks, ["block"], recursive=True)
+    assert block["block"] + block["block"][0]["block"] == test_list_recursive
+
+
+@pytest.mark.parametrize(
+    ("template", "output"),
+    (
+        pytest.param("{{ playbook_dir }}", "/a/b/c", id="simple"),
+        # Does not work the same with ansible 2.19 with data tagging
+        # pytest.param(
+        #     "{{ 'hello' | doesnotexist }}",
+        #     "hello",  # newer implementation ignores unknown filters
+        #     id="unknown_filter",
+        # ),
+        pytest.param(
+            "{{ hello | to_json }}",
+            "{{ hello | to_json }}",
+            id="to_json_filter_on_undefined_variable",
+        ),
+        pytest.param(
+            "{{ hello | to_nice_yaml }}",
+            "{{ hello | to_nice_yaml }}",
+            id="to_nice_yaml_filter_on_undefined_variable",
+        ),
+    ),
+)
+def test_template(template: str, output: str) -> None:
+    """Verify that resolvable template vars and filters get rendered."""
+    result = utils.template(
+        basedir=Path("/base/dir"),
+        value=template,
+        variables={"playbook_dir": "/a/b/c"},
+        fail_on_error=False,
+    )
+    assert result == output
+
+
+@pytest.mark.parametrize(
+    ("template", "has_lookup"),
+    (
+        pytest.param(
+            "{{ lookup('file', '/etc/hostname') }}",
+            True,
+            id="file_lookup",
+        ),
+        pytest.param(
+            "Welcome {{ lookup('env', 'USER', default='user') }}!",
+            True,
+            id="lookup_with_text",
+        ),
+        pytest.param(
+            "{{ query('env', 'HOME') }}",
+            True,
+            id="query_function_call",
+        ),
+        pytest.param(
+            "{{ q('env', 'HOME') }}",
+            True,
+            id="q_function_call",
+        ),
+        # query() with whitespace - should still be detected, will throw spacing errors
+        pytest.param(
+            "{{ query  ('dict', my_var) }}",
+            True,
+            id="query_function_with_whitespace",
+        ),
+        pytest.param(
+            "{{ some_function(lookup('env', 'USER')) }}",
+            True,
+            id="nested_with_function",
+        ),
+        pytest.param(
+            "{{ (query)('env', 'HOME') }}",
+            True,
+            id="query_with_parentheses",
+        ),
+        pytest.param(
+            "{{ (q)('env', 'HOME') }}",
+            True,
+            id="q_with_parentheses",
+        ),
+        pytest.param(
+            "{{ 'This string contains lookup but not a call' }}",
+            False,
+            id="lookup_in_string",
+        ),
+        pytest.param(
+            "{{ query_result }}",
+            False,
+            id="query_variable_name",
+        ),
+        pytest.param(
+            "{{ my_dict.lookup }}",
+            False,
+            id="lookup_as_attribute",
+        ),
+    ),
+)
+def test_template_lookup_behavior(template: str, has_lookup: bool) -> None:
+    """Test template behavior for both ansible-core >= 2.19 and < 2.19."""
+    # Use the lookup detection function directly
+    detected_lookup = utils.has_lookup_function_calls(template)
+    assert detected_lookup == has_lookup, (
+        f"Expected has_lookup_function_calls({template!r}) to return {has_lookup}, "
+        f"but got {detected_lookup}"
+    )
+
+    # Then test template behavior
+    result = utils.template(
+        basedir=Path("/base/dir"),
+        value=template,
+        variables={"some_var": "test_value"},
+        fail_on_error=False,
+    )
+
+    # Get ansible-core version to determine expected behavior
+    deps = get_deps_versions()
+    ansible_version = deps.get("ansible-core")
+    is_new_ansible = ansible_version and ansible_version >= Version("2.19")
+
+    if has_lookup and is_new_ansible:
+        # For ansible-core >= 2.19: lookups should be skipped (returned unchanged)
+        assert result == template, (
+            f"Expected lookup to be skipped for ansible-core >= 2.19, but got: {result}"
+        )
+
+
+def test_task_to_str_unicode() -> None:
+    """Ensure that extracting messages from tasks preserves Unicode."""
+    task = utils.Task({"fail": {"msg": "unicode é ô à"}}, filename="filename.yml")
+    assert str(task) == "fail msg=unicode é ô à"
+
+
+def test_logger_debug(caplog: LogCaptureFixture) -> None:
+    """Test that the double verbosity arg causes logger to be DEBUG."""
+    options = cli.get_config(["-vv"])
+    initialize_logger(options.verbosity)
+
+    expected_info = (
+        "ansiblelint.__main__",
+        logging.DEBUG,
+        "Logging initialized to level 10",
+    )
+
+    assert expected_info in caplog.record_tuples
+
+
+@pytest.mark.libyaml
+def test_cli_auto_detect(capfd: CaptureFixture[str]) -> None:
+    """Test that run without arguments it will detect and lint the entire repository."""
+    cmd = [
+        sys.executable,
+        "-m",
+        "ansiblelint",
+        "-x",
+        "schema",  # exclude schema as our test file would fail it
+        "-v",
+        "--format=pep8",
+        "--nocolor",
+        "--offline",
+        "--exclude=examples",
+        "--exclude=test",
+        "--exclude=src",
+        "--exclude=collections",
+        "--exclude=.github",
+    ]
+    result = subprocess.run(cmd, check=False).returncode
+
+    # We de expect to fail on our own repo due to test examples we have
+    assert result == RC.VIOLATIONS_FOUND
+
+    out, err = capfd.readouterr()
+
+    # An expected rule match from our examples
+    assert any(
+        x in out
+        for x in ("playbook.yml:6: name[casing]", "playbook.yml:6:13: name[casing]")
+    )
+    # assures that our ansible-lint config exclude was effective in excluding github files
+    assert "Identified: .github/" not in out
+    # assures that we can parse playbooks as playbooks
+    assert "Identified: test/test/always-run-success.yml" not in err
+    assert "Executing syntax check on playbook playbook.yml" in err
+
+
+def test_is_playbook() -> None:
+    """Verify that we can detect a playbook as a playbook."""
+    assert utils.is_playbook(filename="examples/playbooks/always-run-success.yml")
+    assert utils.is_playbook(
+        filename="examples/playbooks/import-failed-syntax-check.yml"
+    )
+    assert utils.is_playbook(filename="examples/playbooks/import_playbook_fqcn.yml")
+
+
+@pytest.mark.parametrize(
+    "exclude",
+    (pytest.param("foo", id="1"), pytest.param("foo/", id="2")),
+)
+def test_auto_detect_exclude(tmp_path: Path, exclude: str) -> None:
+    """Verify that exclude option can be used to narrow down detection."""
+    with cwd(tmp_path):
+        subprocess.check_output(
+            "git init",
+            stderr=subprocess.STDOUT,
+            text=True,
+            shell=True,
+            cwd=tmp_path,
+        )
+        (tmp_path / "foo").mkdir()
+        (tmp_path / "bar").mkdir()
+        (tmp_path / "foo" / "playbook.yml").touch()
+        (tmp_path / "bar" / "playbook.yml").touch()
+
+        options = cli.get_config(["--exclude", exclude])
+        options.cwd = tmp_path
+        result = utils.get_lintables(options)
+        assert result == [Lintable("bar/playbook.yml", kind="playbook")]
+
+        # now we also test with .gitignore exclude approach
+        (tmp_path / ".gitignore").write_text(f".gitignore\n{exclude}\n")
+        options = cli.get_config([])
+        options.cwd = tmp_path
+        result = utils.get_lintables(options)
+        assert result == [Lintable("bar/playbook.yml", kind="playbook")]
+
+
+_DEFAULT_RULEDIRS = [constants.DEFAULT_RULESDIR]
+_CUSTOM_RULESDIR = Path(__file__).parent / "custom_rules"
+_CUSTOM_RULEDIRS = [
+    _CUSTOM_RULESDIR / "example_inc",
+    _CUSTOM_RULESDIR / "example_com",
+]
+
+
+@pytest.mark.parametrize(
+    ("user_ruledirs", "use_default", "expected"),
+    (
+        ([], True, _DEFAULT_RULEDIRS),
+        ([], False, _DEFAULT_RULEDIRS),
+        (_CUSTOM_RULEDIRS, True, _CUSTOM_RULEDIRS + _DEFAULT_RULEDIRS),
+        (_CUSTOM_RULEDIRS, False, _CUSTOM_RULEDIRS),
+    ),
+)
+def test_get_rules_dirs(
+    user_ruledirs: list[Path],
+    use_default: bool,
+    expected: list[Path],
+) -> None:
+    """Test it returns expected dir lists."""
+    assert get_rules_dirs(user_ruledirs, use_default=use_default) == expected
+
+
+@pytest.mark.parametrize(
+    ("user_ruledirs", "use_default", "expected"),
+    (
+        ([], True, sorted(_CUSTOM_RULEDIRS) + _DEFAULT_RULEDIRS),
+        ([], False, sorted(_CUSTOM_RULEDIRS) + _DEFAULT_RULEDIRS),
+        (
+            _CUSTOM_RULEDIRS,
+            True,
+            _CUSTOM_RULEDIRS + sorted(_CUSTOM_RULEDIRS) + _DEFAULT_RULEDIRS,
+        ),
+        (_CUSTOM_RULEDIRS, False, _CUSTOM_RULEDIRS),
+    ),
+)
+def test_get_rules_dirs_with_custom_rules(
+    user_ruledirs: list[Path],
+    use_default: bool,
+    expected: list[Path],
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Test it returns expected dir lists when custom rules exist."""
+    monkeypatch.setenv(constants.CUSTOM_RULESDIR_ENVVAR, str(_CUSTOM_RULESDIR))
+    assert get_rules_dirs(user_ruledirs, use_default=use_default) == expected
+
+
+def test_find_children(default_rules_collection: RulesCollection) -> None:
+    """Verify correct function of find_children()."""
+    Runner(
+        rules=default_rules_collection,
+    ).find_children(Lintable("examples/playbooks/find_children.yml"))
+
+
+def test_find_children_in_task(default_rules_collection: RulesCollection) -> None:
+    """Verify correct function of find_children() in tasks."""
+    Runner(
+        Lintable("examples/playbooks/tasks/bug-2875.yml"),
+        rules=default_rules_collection,
+    ).run()
+
+
+@pytest.mark.parametrize(
+    ("file", "names", "positions"),
+    (
+        pytest.param(
+            "examples/playbooks/task_in_list-0.yml",
+            ["A", "B", "C", "D", "E", "F", "G"],
+            [
+                ".[0].tasks[0]",
+                ".[0].tasks[1]",
+                ".[0].pre_tasks[0]",
+                ".[0].post_tasks[0]",
+                ".[0].post_tasks[0].block[0]",
+                ".[0].post_tasks[0].rescue[0]",
+                ".[0].post_tasks[0].always[0]",
+            ],
+            id="0",
+        ),
+    ),
+)
+def test_task_in_list(file: str, names: list[str], positions: list[str]) -> None:
+    """Check that tasks get extracted from blocks if present."""
+    lintable = Lintable(file)
+    assert lintable.kind
+    tasks = list(
+        utils.task_in_list(data=lintable.data, file=lintable, kind=lintable.kind),
+    )
+    assert len(tasks) == len(names)
+    for index, task in enumerate(tasks):
+        assert task.name == names[index]
+        assert task.position == positions[index]
+
+
+def test_find_children_in_module(default_rules_collection: RulesCollection) -> None:
+    """Verify correct function of find_children() in tasks."""
+    lintable = Lintable("plugins/modules/fake_module.py")
+    children = Runner(
+        rules=default_rules_collection,
+    ).find_children(lintable)
+    assert len(children) == 1
+    child = children[0]
+
+    # Parent is a python file
+    assert lintable.base_kind == "text/python"
+
+    # Child correctly looks like a YAML file
+    assert child.base_kind == "text/yaml"
+    assert child.content.startswith("---")
+
+
+def test_find_children_in_playbook(default_rules_collection: RulesCollection) -> None:
+    """Verify correct function of find_children() in playbooks."""
+    lintable = Lintable("examples/playbooks/bug-4095.yml")
+    children = Runner(
+        rules=default_rules_collection,
+    ).find_children(lintable)
+    assert len(children) == 1
+    assert children[0].role == "bug4095"
+
+
+def test_include_children_load_playbook_failed_syntax_check() -> None:
+    """Verify include_children() logs playbook failed to load due to syntax-check."""
+    result = run_ansible_lint(
+        Path("playbooks/import-failed-syntax-check.yml"),
+        cwd=Path(__file__).resolve().parent.parent / "examples",
+    )
+    assert (
+        "Failed to load syntax-error.yml playbook due to failing syntax check."
+        in result.stderr
+    )
+
+
+def test_import_playbook_children() -> None:
+    """Verify import_playbook_children()."""
+    result = run_ansible_lint(
+        Path("playbooks/import_playbook_fqcn.yml"),
+        cwd=Path(__file__).resolve().parent.parent / "examples",
+        env={
+            "ANSIBLE_COLLECTIONS_PATH": "../collections",
+        },
+    )
+    assert "Failed to find local.testcollection.foo playbook." not in result.stderr
+    assert "Failed to find local.testcollection.foo.yml playbook." not in result.stderr
+    assert (
+        "Failed to load local.testcollection.foo playbook due to failing syntax check."
+        not in result.stderr
+    )
+
+
+def test_import_playbook_children_subdirs() -> None:
+    """Verify import_playbook_children() when playbook is in a subdirectory."""
+    result = run_ansible_lint(
+        Path("playbooks/import_playbook_fqcn.yml"),
+        cwd=Path(__file__).resolve().parent.parent / "examples",
+        env={
+            "ANSIBLE_COLLECTIONS_PATH": "../collections",
+        },
+    )
+    assert (
+        "Failed to find local.testcollection.test.bar.foo playbook."
+        not in result.stderr
+    )
+
+
+def test_import_role_children_subdirs() -> None:
+    """Verify import_playbook_children()."""
+    result = run_ansible_lint(
+        Path("playbooks/import_role_fqcn.yml"),
+        cwd=Path(__file__).resolve().parent.parent / "examples",
+        env={
+            "ANSIBLE_COLLECTIONS_PATH": "../collections",
+        },
+    )
+    assert "Failed " not in result.stderr
+
+
+def test_include_children_climbing(tmp_path: Path) -> None:
+    """Verify that include_children climbs to find tasks in a tasks/ directory."""
+    project = tmp_path / "project"
+    project.mkdir()
+    tasks_dir = project / "tasks"
+    tasks_dir.mkdir()
+
+    site_yml = project / "site.yml"
+    site_yml.write_text("- import_tasks: imported_task.yml", encoding="utf-8")
+
+    imported_task = tasks_dir / "imported_task.yml"
+    imported_task.write_text("- debug: msg=hello", encoding="utf-8")
+
+    from ansiblelint.app import App
+    from ansiblelint.config import options as lint_options
+    from ansiblelint.rules import RulesCollection
+
+    app = App(options=lint_options)
+    rules = RulesCollection(app=app)
+    handler = utils.HandleChildren(rules=rules, app=app)
+
+    with cwd(project):
+        lintable = Lintable(site_yml)
+        children = handler.include_children(
+            lintable, k="import_tasks", v="imported_task.yml", parent_type="tasks"
+        )
+
+        assert len(children) == 1
+        assert children[0].path.resolve() == imported_task.resolve()
+
+
+def test_get_task_handler_children_climbing(tmp_path: Path) -> None:
+    """Verify that task handler resolution climbs to find tasks in a tasks/ directory."""
+    project = tmp_path / "project"
+    project.mkdir()
+    tasks_dir = project / "tasks"
+    tasks_dir.mkdir()
+
+    imported_task = tasks_dir / "imported_task.yml"
+    imported_task.write_text("- debug: msg=hello", encoding="utf-8")
+
+    task_handler = {"import_tasks": "imported_task.yml"}
+
+    with cwd(project):
+        child = utils._get_task_handler_children_for_tasks_or_playbooks(  # ruff:ignore[private-member-access]
+            task_handler=task_handler,
+            basedir=str(project),
+            k="import_tasks",
+            parent_type="tasks",
+        )
+
+        assert child.path.resolve() == imported_task.resolve()
+
+
+def test_parse_yaml_linenumbers_rereads_changed_content(tmp_path: Path) -> None:
+    """Updated lintable content must not reuse stale cached parse results."""
+    task_file = tmp_path / "tasks.yml"
+    task_file.write_text("- name: lowercase task\n  debug: msg=hi\n", encoding="utf-8")
+    lintable = Lintable(task_file)
+
+    first = utils.parse_yaml_linenumbers(lintable)
+    assert first[0]["name"] == "lowercase task"  # type: ignore[index]
+
+    lintable.content = "- name: Uppercase task\n  debug: msg=hi\n"
+    second = utils.parse_yaml_linenumbers(lintable)
+
+    assert second[0]["name"] == "Uppercase task"  # type: ignore[index]
+
+
+def test_parse_yaml_linenumbers_returns_independent_copies(tmp_path: Path) -> None:
+    """Cached YAML parses must not share mutations across callers."""
+    from ansiblelint.constants import SKIPPED_RULES_KEY
+
+    task_file = tmp_path / "tasks.yml"
+    task_file.write_text("- name: Task one\n  debug: msg=hi\n", encoding="utf-8")
+    lintable = Lintable(task_file)
+
+    first = utils.parse_yaml_linenumbers(lintable)
+    second = utils.parse_yaml_linenumbers(lintable)
+
+    assert first is not None
+    assert second is not None
+    assert first is not second
+    first[0][SKIPPED_RULES_KEY] = ["yaml"]
+    assert SKIPPED_RULES_KEY not in second[0]
+
+
+def test_warn_list_preserves_line_length_after_name_fix(tmp_path: Path) -> None:
+    """warn_list rules must not be auto-fixed after another rule rewrites the file (#5030)."""
+    (tmp_path / ".ansible-lint").write_text(
+        "write_list:\n  - name\nwarn_list:\n  - yaml[line-length]\n",
+        encoding="utf-8",
+    )
+    tasks_dir = tmp_path / "roles" / "demo" / "tasks"
+    tasks_dir.mkdir(parents=True)
+    long_expr = "".join(f" | regex_replace('k{i}', 'v{i}')" for i in range(12))
+    shell_line = f"  ansible.builtin.shell: \"{{{{ lookup('template', 'long.j2'){long_expr} }}}}\""
+    assert len(shell_line) > 160
+    (tasks_dir / "main.yml").write_text(
+        "---\n"
+        "- name: check service status\n"
+        "  ansible.builtin.command: systemctl status nginx\n\n"
+        "- name: run complex command\n"
+        f"{shell_line}\n",
+        encoding="utf-8",
+    )
+
+    result = run_ansible_lint(
+        "--fix",
+        "roles/demo/",
+        cwd=tmp_path,
+        env={"ANSIBLE_LINT_NODEPS": "1"},
+    )
+    output = result.stdout + result.stderr
+    assert "Error trying to append skipped rules" not in output
+    assert "yaml[line-length]" in output
+
+    text = (tasks_dir / "main.yml").read_text(encoding="utf-8")
+    assert "Check service status" in text
+    assert "Run complex command" in text
+    shell_lines = [
+        line for line in text.splitlines() if "ansible.builtin.shell" in line
+    ]
+    assert len(shell_lines) == 1
+    assert len(shell_lines[0]) > 160
+
+
+def test_warn_list_preserves_line_length_repro5030_content(tmp_path: Path) -> None:
+    """warn_list must keep long lines intact for typical repro5030 shell tasks (#5030)."""
+    (tmp_path / ".ansible-lint").write_text(
+        "write_list:\n  - name\nwarn_list:\n  - yaml[line-length]\n",
+        encoding="utf-8",
+    )
+    tasks_dir = tmp_path / "roles" / "demo" / "tasks"
+    tasks_dir.mkdir(parents=True)
+    shell_line = (
+        "  ansible.builtin.shell: \"{{ lookup('template', 'long.j2') | join(' ')"
+        " | regex_replace('foo', 'bar') | regex_replace('baz', 'qux')"
+        " | regex_replace('alpha', 'beta') | regex_replace('gamma', 'delta')"
+        " | regex_replace('epsilon', 'zeta') | regex_replace('eta', 'theta') }}\""
+    )
+    assert len(shell_line) > 160
+    (tasks_dir / "main.yml").write_text(
+        "---\n"
+        "- name: check service status\n"
+        "  ansible.builtin.command: systemctl status nginx\n"
+        "- name: run complex command\n"
+        f"{shell_line}\n",
+        encoding="utf-8",
+    )
+
+    result = run_ansible_lint(
+        "--fix",
+        "roles/demo/",
+        cwd=tmp_path,
+        env={"ANSIBLE_LINT_NODEPS": "1"},
+    )
+    output = result.stdout + result.stderr
+    assert "Error trying to append skipped rules" not in output
+    assert "yaml[line-length]" in output
+
+    text = (tasks_dir / "main.yml").read_text(encoding="utf-8")
+    shell_lines = [
+        line for line in text.splitlines() if "ansible.builtin.shell" in line
+    ]
+    assert len(shell_lines) == 1
+    assert len(shell_lines[0]) > 160
+
+
+def test_remove_task_internal_keys_nested_lists() -> None:
+    """Internal keys nested inside lists must be stripped during sanitization."""
+    task = {
+        "name": "nested",
+        "block": [
+            {
+                "name": "inner",
+                "__line__": 2,
+                "__file__": "tasks.yml",
+                "__skipped_rules__": ["fqcn"],
+                "ansible.builtin.debug": {"msg": "hi", "__line__": 3},
+            },
+            "not-a-mapping",
+        ],
+        "__line__": 1,
+        "__file__": "tasks.yml",
+    }
+
+    cleaned = utils._sanitize_task(task)  # ruff:ignore[private-member-access]
+
+    assert "__line__" not in cleaned
+    assert "__file__" not in cleaned
+    inner = cleaned["block"][0]
+    assert "__line__" not in inner
+    assert "__file__" not in inner
+    assert "__skipped_rules__" not in inner
+    assert "__line__" not in inner["ansible.builtin.debug"]
+    assert cleaned["block"][1] == "not-a-mapping"
+
+    # Call the extracted helpers directly so coverage maps to the new symbols.
+    nested = {
+        "block": [{"__line__": 1, "debug": {"msg": "x"}}],
+        "__file__": "x.yml",
+    }
+    utils._strip_internal_keys_from_mapping(nested)  # ruff:ignore[private-member-access]
+    assert "__file__" not in nested
+    assert "__line__" not in nested["block"][0]
+    utils._strip_internal_keys_from_value([{"__line__": 2}, "skip"])  # ruff:ignore[private-member-access]
+    double_nested = [[{"__line__": 3}]]
+    utils._strip_internal_keys_from_value(double_nested)  # ruff:ignore[private-member-access]
+    assert "__line__" not in double_nested[0][0]
+    assert utils._remove_task_internal_keys({"__line__": 3}) == {}  # ruff:ignore[private-member-access]
+
+
+def test_sanitize_task_does_not_modify_original() -> None:
+    """Sanitizing must strip internal keys from a copy, never from the input."""
+    task: dict[str, Any] = {
+        "name": "loop over dicts",
+        "__line__": 1,
+        "__file__": "tasks.yml",
+        "__skipped_rules__": ["fqcn"],
+        "ansible.builtin.user": {
+            "name": "{{ item.name }}",
+            "groups": ["wheel", "adm"],
+            "__line__": 4,
+        },
+        "loop": [
+            {"name": "alice", "__line__": 8, "extra": {"__line__": 9, "a": 1}},
+            {"name": "bob", "__line__": 10},
+            ["nested", {"__line__": 12, "b": 2}],
+            "plain",
+        ],
+        "vars": {"outer": {"inner": {"__line__": 14, "c": 3}}},
+    }
+    original = copy.deepcopy(task)
+
+    cleaned = utils._sanitize_task(task)  # ruff:ignore[private-member-access]
+
+    assert cleaned == {
+        "name": "loop over dicts",
+        "ansible.builtin.user": {"name": "{{ item.name }}", "groups": ["wheel", "adm"]},
+        "loop": [
+            {"name": "alice", "extra": {"a": 1}},
+            {"name": "bob"},
+            ["nested", {"b": 2}],
+            "plain",
+        ],
+        "vars": {"outer": {"inner": {"c": 3}}},
+    }
+    assert task == original
+    # Containers must not be shared, so later changes cannot leak back.
+    assert cleaned["ansible.builtin.user"] is not task["ansible.builtin.user"]
+    assert (
+        cleaned["ansible.builtin.user"]["groups"]
+        is not task["ansible.builtin.user"]["groups"]
+    )
+    assert cleaned["loop"] is not task["loop"]
+    assert cleaned["loop"][0] is not task["loop"][0]
+    assert cleaned["loop"][2][1] is not task["loop"][2][1]
+    assert cleaned["vars"]["outer"]["inner"] is not task["vars"]["outer"]["inner"]
+    copied = utils._copy_task_containers(task)  # ruff:ignore[private-member-access]
+    assert copied["__skipped_rules__"] is task["__skipped_rules__"]
+
+
+def test_sanitize_task_matches_deepcopy_on_loaded_yaml(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Sanitizing loaded tasks must behave as the former deepcopy approach."""
+    task_file = tmp_path / "tasks.yml"
+    task_file.write_text(
+        """\
+- name: Create users
+  ansible.builtin.user:
+    name: "{{ item.name }}"
+    groups: "{{ item.groups }}"
+  loop:
+    - name: alice
+      groups: [wheel, adm]
+    - name: bob
+      groups: []
+  loop_control:
+    label: "{{ item.name }}"
+- name: Run command  # noqa: no-changed-when
+  ansible.builtin.command:
+    argv: [echo, hello]
+  args:
+    chdir: /tmp
+  when:
+    - true
+    - foo is defined
+- name: Old style
+  action: shell echo hi
+  with_items: [[1, 2], {a: b}]
+""",
+        encoding="utf-8",
+    )
+    tasks = utils.parse_yaml_linenumbers(Lintable(task_file))
+    assert isinstance(tasks, list)
+
+    def sanitize_with_deepcopy(task: Any) -> Any:
+        return utils._remove_task_internal_keys(copy.deepcopy(task))  # ruff:ignore[private-member-access]
+
+    expected_normalized = []
+    for raw_task in tasks:
+        original = copy.deepcopy(raw_task)
+        cleaned = utils._sanitize_task(raw_task)  # ruff:ignore[private-member-access]
+        assert cleaned == sanitize_with_deepcopy(raw_task)
+        assert type(cleaned) is type(raw_task)
+        assert raw_task == original
+        expected_normalized.append(
+            utils.normalize_task_v2(utils.Task(raw_task, filename=str(task_file)))
+        )
+        assert raw_task == original
+
+    monkeypatch.setattr(utils, "_sanitize_task", sanitize_with_deepcopy)
+    for raw_task, expected in zip(tasks, expected_normalized, strict=True):
+        assert (
+            utils.normalize_task_v2(utils.Task(raw_task, filename=str(task_file)))
+            == expected
+        )
+
+
+def test_set_normalized_action_copies_line() -> None:
+    """Normalized action should preserve __line__ from the raw task module map."""
+    task = utils.Task(
+        {
+            "name": "copy line",
+            "ansible.builtin.debug": {"msg": "x", "__line__": 9},
+        },
+        filename="tasks.yml",
+    )
+    result: dict[str, Any] = {}
+    utils._set_normalized_action(  # ruff:ignore[private-member-access]
+        result,
+        "ansible.builtin.debug",
+        {"msg": "x"},
+        task,
+    )
+    assert result["action"]["__ansible_module__"] == "debug"
+    assert result["action"]["__line__"] == 9
+
+    with pytest.raises(TypeError, match="Task actions can only be strings"):
+        utils._set_normalized_action(result, 123, {}, task)  # type: ignore[arg-type]  # ruff:ignore[private-member-access]
+
+
+def test_parser_error_helpers_cover_extracted_branches(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Cover parser-error helpers extracted for Sonar complexity limits."""
+    from ansible.errors import AnsibleParserError
+
+    from ansiblelint.errors import MatchError
+
+    raw_with_line = {"name": "x", "__line__": 7}
+    exc_with_coords = AnsibleParserError("failed at line 9, column 4")
+    assert utils._parser_error_line_column(exc_with_coords, raw_with_line) == (  # ruff:ignore[private-member-access]
+        7,
+        None,
+    )
+
+    # Avoid ansible Origin tagging quirks on plain dicts; force the regex/fallback paths.
+    from ansiblelint import yaml_utils
+
+    monkeypatch.setattr(yaml_utils, "get_line_column", lambda *_a, **_k: (0, None))
+    exc_regex_only = AnsibleParserError("failed at line 9, column 4")
+    assert utils._parser_error_line_column(exc_regex_only, {"name": "x"}) == (  # ruff:ignore[private-member-access]
+        9,
+        4,
+    )
+    assert utils._parser_error_line_column(  # ruff:ignore[private-member-access]
+        AnsibleParserError("no coordinates"),
+        {"name": "x"},
+    ) == (0, 0)
+
+    task = utils.Task({"name": "broken"}, filename="tasks.yml")
+    unexpected_exc = AnsibleParserError("unexpected parse failure")
+    with pytest.raises(MatchError, match="unexpected parse failure"):
+        utils._handle_parser_error(  # ruff:ignore[private-member-access]
+            unexpected_exc,
+            task.raw_task,
+            {"name": "broken"},
+            task,
+        )
+
+    bare_var_exc = AnsibleParserError(
+        "Complex args containing variables cannot use bare variables: foo",
+    )
+    action, result = utils._handle_parser_error(  # ruff:ignore[private-member-access]
+        bare_var_exc,
+        task.raw_task,
+        {"action": "debug", "name": "broken"},
+        task,
+    )
+    assert action == "debug"
+    assert result["action"] == "debug"
+
+    with pytest.raises(NotImplementedError, match="Unable to normalize task"):
+        utils._handle_parser_error(  # ruff:ignore[private-member-access]
+            bare_var_exc,
+            task.raw_task,
+            {"name": "broken"},
+            task,
+        )
+
+
+def test_import_playbook_children_extra_vars_success(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Verify import_playbook_children re-checks with extra_vars on initial failure."""
+    from ansiblelint.app import App
+    from ansiblelint.config import Options
+    from ansiblelint.rules import RulesCollection
+
+    # Create a playbook file
+    inner = tmp_path / "inner.yml"
+    inner.write_text("---\n- hosts: localhost\n  tasks: []\n")
+    outer = tmp_path / "outer.yml"
+    outer.write_text("---\n- import_playbook: inner.yml\n")
+
+    options = Options()
+    options.extra_vars = {"my_host": "localhost"}
+    app = App(options=options)
+    rules = RulesCollection(app=app)
+    handler = utils.HandleChildren(rules=rules, app=app)
+
+    # Mock has_playbook to return False (initial check fails)
+    monkeypatch.setattr(app.runtime, "has_playbook", lambda _: False)
+    # Mock _recheck_playbook_with_extra_vars at class level to return True
+    monkeypatch.setattr(
+        utils.HandleChildren,
+        "_recheck_playbook_with_extra_vars",
+        lambda _self, _path: True,
+    )
+
+    lintable = Lintable(outer)
+    children = handler.import_playbook_children(
+        lintable, "import_playbook", "inner.yml", "playbook"
+    )
+
+    assert len(children) == 1
+    assert children[0].path.name == "inner.yml"
+
+
+def test_import_playbook_children_extra_vars_recheck_fails(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    caplog: LogCaptureFixture,
+) -> None:
+    """Verify import_playbook_children logs error when re-check also fails."""
+    from ansiblelint.app import App
+    from ansiblelint.config import Options
+    from ansiblelint.rules import RulesCollection
+
+    inner = tmp_path / "inner.yml"
+    inner.write_text("---\n- hosts: localhost\n  tasks: []\n")
+    outer = tmp_path / "outer.yml"
+    outer.write_text("---\n- import_playbook: inner.yml\n")
+
+    options = Options()
+    options.extra_vars = {"my_host": "localhost"}
+    app = App(options=options)
+    rules = RulesCollection(app=app)
+    handler = utils.HandleChildren(rules=rules, app=app)
+
+    monkeypatch.setattr(app.runtime, "has_playbook", lambda _: False)
+    # Mock _recheck_playbook_with_extra_vars at class level to return False
+    monkeypatch.setattr(
+        utils.HandleChildren,
+        "_recheck_playbook_with_extra_vars",
+        lambda _self, _path: False,
+    )
+
+    lintable = Lintable(outer)
+    with caplog.at_level(logging.ERROR):
+        children = handler.import_playbook_children(
+            lintable, "import_playbook", "inner.yml", "playbook"
+        )
+
+    assert children == []
+    assert "Failed to load" in caplog.text
+
+
+def test_import_playbook_children_no_extra_vars(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    caplog: LogCaptureFixture,
+) -> None:
+    """Verify import_playbook_children skips re-check when no extra_vars."""
+    from ansiblelint.app import App
+    from ansiblelint.config import Options
+    from ansiblelint.rules import RulesCollection
+
+    inner = tmp_path / "inner.yml"
+    inner.write_text("---\n- hosts: localhost\n  tasks: []\n")
+    outer = tmp_path / "outer.yml"
+    outer.write_text("---\n- import_playbook: inner.yml\n")
+
+    options = Options()
+    options.extra_vars = {}  # No extra_vars
+    app = App(options=options)
+    rules = RulesCollection(app=app)
+    handler = utils.HandleChildren(rules=rules, app=app)
+
+    monkeypatch.setattr(app.runtime, "has_playbook", lambda _: False)
+    # _recheck_playbook_with_extra_vars returns False when no extra_vars
+    recheck_called = []
+
+    def mock_recheck(_self: Any, _path: Path) -> bool:
+        recheck_called.append(True)
+        return False
+
+    monkeypatch.setattr(
+        utils.HandleChildren,
+        "_recheck_playbook_with_extra_vars",
+        mock_recheck,
+    )
+
+    lintable = Lintable(outer)
+    with caplog.at_level(logging.ERROR):
+        children = handler.import_playbook_children(
+            lintable, "import_playbook", "inner.yml", "playbook"
+        )
+
+    assert children == []
+    assert "Failed to load" in caplog.text
+    # recheck is called but returns False due to empty extra_vars
+    assert recheck_called
+
+
+def test_recheck_playbook_with_extra_vars_no_vars(
+    tmp_path: Path,
+) -> None:
+    """Verify _recheck_playbook_with_extra_vars returns False when no extra_vars."""
+    from ansiblelint.app import App
+    from ansiblelint.config import Options
+    from ansiblelint.rules import RulesCollection
+
+    playbook = tmp_path / "test.yml"
+    playbook.write_text("---\n- hosts: localhost\n  tasks: []\n")
+
+    options = Options()
+    options.extra_vars = {}
+    app = App(options=options)
+    rules = RulesCollection(app=app)
+    handler = utils.HandleChildren(rules=rules, app=app)
+
+    result = handler._recheck_playbook_with_extra_vars(playbook)  # ruff:ignore[private-member-access]
+    assert result is False
+
+
+def test_resolve_playbook_path_not_exists(
+    tmp_path: Path,
+) -> None:
+    """Verify _resolve_playbook_path returns error when path doesn't exist."""
+    from ansiblelint.app import App
+    from ansiblelint.config import Options
+    from ansiblelint.rules import RulesCollection
+
+    outer = tmp_path / "outer.yml"
+    outer.write_text("---\n- import_playbook: missing.yml\n")
+
+    options = Options()
+    app = App(options=options)
+    rules = RulesCollection(app=app)
+    handler = utils.HandleChildren(rules=rules, app=app)
+
+    missing = tmp_path / "missing.yml"
+    result = handler._resolve_playbook_path(missing, False, "playbook", "missing.yml")  # ruff:ignore[private-member-access]
+    assert isinstance(result, tuple)
+    assert result == ("not_found", "Failed to find missing.yml playbook.")
+
+
+def test_resolve_playbook_path_collection_success(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Verify _resolve_playbook_path returns empty list for valid collection playbook."""
+    from ansiblelint.app import App
+    from ansiblelint.config import Options
+    from ansiblelint.rules import RulesCollection
+
+    playbook = tmp_path / "test.yml"
+    playbook.write_text("---\n- hosts: localhost\n  tasks: []\n")
+
+    options = Options()
+    app = App(options=options)
+    rules = RulesCollection(app=app)
+    handler = utils.HandleChildren(rules=rules, app=app)
+
+    monkeypatch.setattr(app.runtime, "has_playbook", lambda _: True)
+
+    result = handler._resolve_playbook_path(playbook, True, "playbook", "test.yml")  # ruff:ignore[private-member-access]
+    assert result == []
+
+
+def test_resolve_playbook_path_local_success(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Verify _resolve_playbook_path returns Lintable for valid local playbook."""
+    from ansiblelint.app import App
+    from ansiblelint.config import Options
+    from ansiblelint.rules import RulesCollection
+
+    playbook = tmp_path / "test.yml"
+    playbook.write_text("---\n- hosts: localhost\n  tasks: []\n")
+
+    options = Options()
+    app = App(options=options)
+    rules = RulesCollection(app=app)
+    handler = utils.HandleChildren(rules=rules, app=app)
+
+    monkeypatch.setattr(app.runtime, "has_playbook", lambda _: True)
+
+    result = handler._resolve_playbook_path(playbook, False, "playbook", "test.yml")  # ruff:ignore[private-member-access]
+    assert isinstance(result, list)
+    assert len(result) == 1
+    assert result[0].path == playbook
+
+
+def test_get_playbook_paths_local(tmp_path: Path) -> None:
+    """Verify _get_playbook_paths returns local path for non-collection."""
+    from ansiblelint.app import App
+    from ansiblelint.config import Options
+    from ansiblelint.rules import RulesCollection
+
+    outer = tmp_path / "outer.yml"
+    outer.write_text("---\n- import_playbook: inner.yml\n")
+
+    options = Options()
+    app = App(options=options)
+    rules = RulesCollection(app=app)
+    handler = utils.HandleChildren(rules=rules, app=app)
+
+    lintable = Lintable(outer)
+    paths = handler._get_playbook_paths(lintable, "inner.yml", "", "", [])  # ruff:ignore[private-member-access]
+    assert len(paths) == 1
+    assert paths[0] == tmp_path / "inner.yml"
+
+
+@pytest.mark.parametrize(
+    ("reference", "playbook_path", "filename"),
+    (
+        ("local.testcollection.foo.yml", ["foo", "yml"], "foo.yml"),
+        ("local.testcollection.foo.yaml", ["foo", "yaml"], "foo.yaml"),
+        (
+            "local.testcollection.sub.foo.yml",
+            ["sub", "foo", "yml"],
+            "sub/foo.yml",
+        ),
+    ),
+)
+def test_get_playbook_paths_collection_extension(
+    tmp_path: Path,
+    reference: str,
+    playbook_path: list[str],
+    filename: str,
+) -> None:
+    """Verify collection playbook paths preserve explicit YAML extensions."""
+    from ansiblelint.app import App
+    from ansiblelint.config import Options
+    from ansiblelint.rules import RulesCollection
+
+    options = Options()
+    app = App(options=options)
+    app.runtime.config.collections_paths = [str(tmp_path)]
+    rules = RulesCollection(app=app)
+    handler = utils.HandleChildren(rules=rules, app=app)
+
+    lintable = Lintable(tmp_path / "outer.yml")
+    paths = handler._get_playbook_paths(  # ruff:ignore[private-member-access]
+        lintable,
+        reference,
+        "local",
+        "testcollection",
+        playbook_path,
+    )
+
+    assert paths == [
+        tmp_path
+        / "ansible_collections"
+        / "local"
+        / "testcollection"
+        / "playbooks"
+        / filename
+    ]
+
+
+def test_import_playbook_children_non_string(tmp_path: Path) -> None:
+    """Verify import_playbook_children returns empty for non-string v."""
+    from ansiblelint.app import App
+    from ansiblelint.config import Options
+    from ansiblelint.rules import RulesCollection
+
+    outer = tmp_path / "outer.yml"
+    outer.write_text("---\n- import_playbook: inner.yml\n")
+
+    options = Options()
+    app = App(options=options)
+    rules = RulesCollection(app=app)
+    handler = utils.HandleChildren(rules=rules, app=app)
+
+    lintable = Lintable(outer)
+    # Pass a dict instead of string
+    result = handler.import_playbook_children(
+        lintable, "import_playbook", {"name": "invalid"}, "playbook"
+    )
+    assert result == []
+
+
+def test_import_playbook_children_missing_playbook(
+    tmp_path: Path,
+    caplog: LogCaptureFixture,
+) -> None:
+    """Verify import_playbook_children logs error for missing playbook."""
+    from ansiblelint.app import App
+    from ansiblelint.config import Options
+    from ansiblelint.rules import RulesCollection
+
+    outer = tmp_path / "outer.yml"
+    outer.write_text("---\n- import_playbook: missing.yml\n")
+
+    options = Options()
+    app = App(options=options)
+    rules = RulesCollection(app=app)
+    handler = utils.HandleChildren(rules=rules, app=app)
+
+    lintable = Lintable(outer)
+    with caplog.at_level(logging.ERROR):
+        result = handler.import_playbook_children(
+            lintable, "import_playbook", "missing.yml", "playbook"
+        )
+
+    assert result == []
+    assert "Failed to find missing.yml playbook" in caplog.text
+
+
+def test_playbook_dir_returns_own_dir_when_no_parent(tmp_path: Path) -> None:
+    """_playbook_dir falls back to the lintable's own directory when no playbook found."""
+    from ansiblelint.utils import _playbook_dir
+
+    tasks_file = tmp_path / "tasks" / "main.yml"
+    tasks_file.parent.mkdir(parents=True)
+    tasks_file.write_text("---\n")
+    lintable = Lintable(tasks_file, kind="tasks")
+    # No parent set — should fall back to tasks_file's directory
+    assert _playbook_dir(lintable) == str(tasks_file.parent)
+
+
+def test_playbook_dir_climbs_to_playbook(tmp_path: Path) -> None:
+    """_playbook_dir returns the playbook's directory when found in parent chain."""
+    from ansiblelint.utils import _playbook_dir
+
+    playbook_file = tmp_path / "site.yml"
+    playbook_file.write_text("---\n")
+    tasks_file = tmp_path / "tasks" / "main.yml"
+    tasks_file.parent.mkdir(parents=True)
+    tasks_file.write_text("---\n")
+
+    playbook = Lintable(playbook_file, kind="playbook")
+    tasks = Lintable(tasks_file, kind="tasks")
+    tasks.parent = playbook
+
+    assert _playbook_dir(tasks) == str(tmp_path)
+
+
+def test_playbook_dir_cycle_detection(tmp_path: Path) -> None:
+    """_playbook_dir does not loop forever on a circular parent reference."""
+    from ansiblelint.utils import _playbook_dir
+
+    tasks_file = tmp_path / "tasks" / "main.yml"
+    tasks_file.parent.mkdir(parents=True)
+    tasks_file.write_text("---\n")
+    lintable = Lintable(tasks_file, kind="tasks")
+    # Create a cycle: lintable points to itself as parent
+    lintable.parent = lintable  # intentional cycle for cycle-detection test
+
+    # Should terminate and fall back to the lintable's own dir
+    result = _playbook_dir(lintable)
+    assert result == str(tasks_file.parent)
+
+
+def test_include_search_basedirs_adds_playbook_dir(tmp_path: Path) -> None:
+    """_include_search_basedirs appends the root playbook dir as a fallback."""
+    from ansiblelint.utils import _include_search_basedirs
+
+    playbook_file = tmp_path / "site.yml"
+    playbook_file.write_text("---\n")
+    tasks_file = tmp_path / "tasks" / "main.yml"
+    tasks_file.parent.mkdir(parents=True)
+    tasks_file.write_text("---\n")
+
+    playbook = Lintable(playbook_file, kind="playbook")
+    tasks = Lintable(tasks_file, kind="tasks")
+    tasks.parent = playbook
+
+    basedirs = _include_search_basedirs(tasks, str(tasks_file.parent))
+
+    # The playbook directory should appear as a fallback
+    assert str(tmp_path) in basedirs
+
+
+def test_include_search_basedirs_no_lintable(tmp_path: Path) -> None:
+    """_include_search_basedirs returns only the basedir when lintable is None."""
+    from ansiblelint.utils import _include_search_basedirs
+
+    basedirs = _include_search_basedirs(None, str(tmp_path))
+    assert basedirs == [str(tmp_path)]
+
+
+def test_include_search_basedirs_cycle_detection(tmp_path: Path) -> None:
+    """_include_search_basedirs terminates when a cycle is present in parent chain."""
+    from ansiblelint.utils import _include_search_basedirs
+
+    tasks_file = tmp_path / "tasks" / "main.yml"
+    tasks_file.parent.mkdir(parents=True)
+    tasks_file.write_text("---\n")
+    lintable = Lintable(tasks_file, kind="tasks")
+    # Create a cycle: parent chain loops back to itself
+    lintable.parent = lintable  # intentional cycle for cycle-detection test
+
+    # Should terminate without infinite loop
+    basedirs = _include_search_basedirs(lintable, str(tasks_file.parent))
+    assert str(tasks_file.parent) in basedirs

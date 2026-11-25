@@ -1,0 +1,33 @@
+name: Test clean playbook passes lint
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        with:
+          override_version: v26.11.1
+          working_directory: ${{ github.workspace }}/tests/fixtures/clean
+          args: playbook.yml
+      - name: Assert action succeeded and ansible-lint is installed
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+        run: |
+          echo "outcome: $OUTCOME"
+          if [ "$OUTCOME" != "success" ]; then
+            echo "FAIL: expected success"
+            exit 1
+          fi
+          if ! command -v ansible-lint >/dev/null 2>&1; then
+            echo "FAIL: ansible-lint not on PATH"
+            exit 1
+          fi
+          ansible-lint --version
+          if [ ! -f "$GITHUB_WORKSPACE/.git/ansible-lint-requirements.txt" ]; then
+            echo "FAIL: requirements lock file not downloaded"
+            exit 1
+          fi
+          echo "PASS"

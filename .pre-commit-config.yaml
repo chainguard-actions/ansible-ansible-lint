@@ -1,0 +1,144 @@
+---
+exclude: >
+  (?x)^(
+    examples/broken/encoding.yml|
+    examples/broken/encoding.j2|
+    examples/broken/yaml-with-tabs/invalid-due-tabs.yaml|
+    examples/broken/load-failure-invalid.yml|
+    examples/playbooks/collections/.*|
+    examples/playbooks/vars/empty.transformed.yml|
+    examples/playbooks/vars/empty.yml|
+    src/ansiblelint/schemas/rulebook.json|
+    test/schemas/data/licenses.json|
+    test/schemas/negative_test|
+    test/schemas/package-lock.json
+  )$
+repos:
+  - repo: meta
+    hooks:
+      - id: check-useless-excludes
+        priority: 0
+  - repo: https://github.com/ansible/actions
+    rev: v1.1.2
+    hooks:
+      - id: toml
+        priority: 0
+      - id: mypy
+        priority: 2
+      - id: ruff
+        priority: 1
+      - id: cspell
+        priority: 0
+      - id: codespell
+        priority: 1
+      - id: pyright
+        priority: 5
+      - id: codecov
+        priority: 0
+      # - id: shellcheck
+      #   priority: 0
+  - repo: https://github.com/astral-sh/uv-pre-commit
+    rev: 0.12.10
+    hooks:
+      - id: uv-sync
+      - id: uv-lock
+      - id: uv-lock
+        name: "deps: upgrade via uv sync --upgrade"
+        alias: deps
+        args: ["--upgrade"]
+        stages: [manual]
+      - id: uv-export
+        name: "deps: regenerate requirements-lock.txt for actions"
+        args:
+          - "--no-default-groups"
+          - "--no-dev"
+          - "--no-emit-package"
+          - ansible-core
+          - "--no-emit-package"
+          - resolvelib
+          - "--no-emit-package"
+          - ruamel-yaml-clib
+          - "--no-emit-package"
+          - tomli
+          - "--no-emit-package"
+          - typing-extensions
+          - "--no-emit-project"
+          - "--no-hashes"
+          - "-o"
+          - ".config/requirements-lock.txt"
+  - repo: https://github.com/biomejs/pre-commit
+    rev: "v2.5.12"
+    hooks:
+      - id: biome-check
+        name: biome
+        alias: biome
+        args: [--unsafe]
+        priority: 0
+  - repo: https://github.com/pre-commit/pre-commit-hooks.git
+    rev: v6.0.0
+    hooks:
+      - id: check-added-large-files
+      - id: check-merge-conflict
+      - id: check-symlinks
+      - id: debug-statements
+      - id: detect-private-key
+      - id: end-of-file-fixer
+        # ignore formatting-prettier to have an accurate prettier comparison
+        exclude: >
+          (?x)^(
+            test/eco/.*.result|
+            examples/yamllint/.*|
+            test/fixtures/formatting-before/.*|
+            test/fixtures/formatting-prettier/.*
+          )$
+      - id: trailing-whitespace
+        exclude: >
+          (?x)^(
+            examples/playbooks/(with-skip-tag-id|unicode|with-multiple-yaml-violations).yml|
+            examples/playbooks/example.yml|
+            examples/yamllint/.*|
+            test/eco/.*.result|
+            test/fixtures/formatting-before/.*
+          )$
+      - id: mixed-line-ending
+      - id: fix-byte-order-marker
+      - id: check-executables-have-shebangs
+      - id: check-merge-conflict
+      - id: debug-statements
+        language_version: python3
+  - repo: https://github.com/adrienverge/yamllint.git
+    rev: v1.38.0
+    hooks:
+      - id: yamllint
+        exclude: >
+          (?x)^(
+            examples/playbooks/templates/.*|
+            examples/playbooks/transform-yaml-comments.yml|
+            examples/yamllint/.*|
+            examples/other/some.j2.yaml|
+            examples/playbooks/collections/.*|
+            test/fixtures/formatting-before/.*
+          )$
+        files: \.(yaml|yml)$
+        types: [file, yaml]
+        entry: yamllint --strict
+
+  - repo: https://github.com/jendrikseipp/vulture
+    rev: v2.16
+    hooks:
+      - id: vulture
+  - repo: https://github.com/ansible/team-devtools
+    rev: c44381c
+    hooks:
+      - id: check-platform-constraints
+        priority: 1
+  - # keep at bottom as these are slower
+    repo: local
+    hooks:
+      - id: schemas
+        name: update json schemas
+        entry: python3 src/ansiblelint/schemas/__main__.py
+        language: python
+        pass_filenames: false
+        always_run: true
+        # stages: [manual]

@@ -1,0 +1,370 @@
+"""Test for app module."""
+
+from pathlib import Path
+
+import pytest
+
+from ansiblelint.__main__ import _rule_is_skipped
+from ansiblelint.constants import RC
+from ansiblelint.file_utils import Lintable
+from ansiblelint.loaders import IgnoreRule, IgnoreRuleQualifier
+from ansiblelint.testing import run_ansible_lint
+
+
+def test_generate_ignore(tmp_path: Path) -> None:
+    """Validate that --generate-ignore dumps expected ignore to the file."""
+    lintable = Lintable(tmp_path / "vars.yaml")
+    lintable.content = "foo: 1\nbar:   baz\n"
+    lintable.write(force=True)
+    ignore_file = tmp_path / ".ansible-lint-ignore"
+    assert not ignore_file.exists()
+    result = run_ansible_lint(lintable.filename, "--generate-ignore", cwd=tmp_path)
+    assert result.returncode == 2
+
+    assert ignore_file.exists()
+    with ignore_file.open(encoding="utf-8") as f:
+        assert "vars.yaml yaml[colons]\n" in f.readlines()
+    # Run again and now we expect to succeed as we have an ignore file.
+    result = run_ansible_lint(lintable.filename, cwd=tmp_path)
+    assert result.returncode == 0
+
+
+def test_app_no_matches(tmp_path: Path) -> None:
+    """Validate that linter returns special exit code if no files are analyzed."""
+    result = run_ansible_lint(cwd=tmp_path)
+    assert result.returncode == RC.NO_FILES_MATCHED
+
+
+def test_with_inventory_concurrent_syntax_checks(tmp_path: Path) -> None:
+    """Validate using inventory file with concurrent syntax checks aren't faulty."""
+    (tmp_path / "ansible.cfg").write_text("[defaults]\ninventory = foo\n")
+    (tmp_path / "foo").write_text("[group_name]\nhost1\nhost2\n")
+    lintable1 = Lintable(tmp_path / "playbook1.yml")
+    lintable2 = Lintable(tmp_path / "playbook2.yml")
+    lintable1.content = "---\n- name: Test\n  hosts:\n    - group_name\n  serial: \"{{ batch | default(groups['group_name'] | length) }}\"\n"
+    lintable2.content = "---\n- name: Test\n  hosts:\n    - group_name\n  serial: \"{{ batch | default(groups['group_name'] | length) }}\"\n"
+    lintable1.kind = "playbook"
+    lintable2.kind = "playbook"
+    lintable1.write(force=True)
+    lintable2.write(force=True)
+
+    counter = 0
+    while counter < 3:
+        result = run_ansible_lint(lintable1.filename, lintable2.filename, cwd=tmp_path)
+        assert result.returncode == RC.SUCCESS
+        # AttributeError err is expected to look like what's reported here,
+        # https://github.com/ansible/ansible-lint/issues/4446.
+        assert "AttributeError" not in result.stderr
+        counter += 1
+
+
+def test_app_profile_skip_list_merged(tmp_path: Path) -> None:
+    """Profile skip_list entries are merged into options.skip_list during App init."""
+    from ansiblelint.app import App
+    from ansiblelint.config import Options
+
+    options = Options()
+    options.project_dir = str(tmp_path)
+    options.cache_dir = tmp_path / ".cache"
+    options.cache_dir.mkdir()
+    options.profile = "basic"
+
+    App(options)
+
+    assert "name[template]" in options.skip_list
+    assert "name[casing]" in options.skip_list
+
+
+def test_app_fixed_violations_coverage(tmp_path: Path) -> None:
+    """Directly test App.report_outcome to get coverage on RC.FIXED_VIOLATIONS."""
+    from ansiblelint.app import App
+    from ansiblelint.config import Options
+    from ansiblelint.runner import LintResult
+
+    options = Options()
+    options.project_dir = str(tmp_path)
+    options.cache_dir = tmp_path / ".cache"
+    options.cache_dir.mkdir()
+
+    app = App(options)
+
+    mock_file = Lintable(tmp_path / "playbook.yml", kind="playbook")
+    mock_file.updated = True
+
+    result = LintResult(files={mock_file}, matches=[])
+
+    exit_code = app.report_outcome(result)
+
+    assert exit_code == RC.FIXED_VIOLATIONS
+
+
+def test_add_module_path_for_plain_mock_modules(tmp_path: Path) -> None:
+    """Plain module mocks are exposed through Ansible's module path as fallback."""
+    from ansiblelint.app import _add_module_path_if_needed
+    from ansiblelint.config import Options
+
+    options = Options()
+    options.cache_dir = tmp_path / ".ansible"
+    options.mock_modules = ["zuul_return", "ns.coll.mod"]
+    module_paths = ["/usr/share/ansible/plugins/modules"]
+
+    _add_module_path_if_needed(options, module_paths)
+
+    assert module_paths == [
+        "/usr/share/ansible/plugins/modules",
+        str(options.cache_dir / "ansible-lint-mocks" / "modules"),
+    ]
+
+
+def test_add_roles_path_for_plain_mock_roles(tmp_path: Path) -> None:
+    """Plain role mocks are exposed through Ansible's roles path.
+
+    Regression test for https://github.com/ansible/ansible-lint/issues/5096: this
+    injection must not depend on Runtime.isolated (which --offline turns off), only
+    on whether _perform_mockings() actually created a plain-name role mock.
+    """
+    from ansiblelint.app import _add_roles_path_if_needed
+    from ansiblelint.config import Options
+
+    options = Options()
+    options.cache_dir = tmp_path / ".ansible"
+    options.mock_roles = ["my_role", "some.collection.role"]
+    roles_paths = ["/usr/share/ansible/roles"]
+
+    _add_roles_path_if_needed(options, roles_paths)
+
+    assert roles_paths[0] == str(options.mock_roles_path)
+
+
+def test_add_roles_path_skips_collection_only_mocks(tmp_path: Path) -> None:
+    """Collection-style role mocks are exposed through collection paths instead."""
+    from ansiblelint.app import _add_roles_path_if_needed
+    from ansiblelint.config import Options
+
+    options = Options()
+    options.cache_dir = tmp_path / ".ansible"
+    options.mock_roles = ["some.collection.role"]
+    roles_paths = ["/usr/share/ansible/roles"]
+
+    _add_roles_path_if_needed(options, roles_paths)
+
+    assert roles_paths == ["/usr/share/ansible/roles"]
+
+
+def test_add_roles_path_idempotent(tmp_path: Path) -> None:
+    """Calling _add_roles_path_if_needed twice does not duplicate the path."""
+    from ansiblelint.app import _add_roles_path_if_needed
+    from ansiblelint.config import Options
+
+    options = Options()
+    options.cache_dir = tmp_path / ".ansible"
+    options.mock_roles = ["my_role"]
+    roles_paths = [str(options.mock_roles_path), "/usr/share/ansible/roles"]
+
+    _add_roles_path_if_needed(options, roles_paths)
+
+    assert roles_paths.count(str(options.mock_roles_path)) == 1
+
+
+def test_add_module_path_skips_collection_only_mocks(tmp_path: Path) -> None:
+    """Collection module mocks are exposed through collection paths instead."""
+    from ansiblelint.app import _add_module_path_if_needed
+    from ansiblelint.config import Options
+
+    options = Options()
+    options.cache_dir = tmp_path / ".ansible"
+    options.mock_modules = ["ns.coll.mod"]
+    module_paths = ["/usr/share/ansible/plugins/modules"]
+
+    _add_module_path_if_needed(options, module_paths)
+
+    assert module_paths == ["/usr/share/ansible/plugins/modules"]
+
+
+def test_update_path_env_prepends_without_duplicates() -> None:
+    """Verify _update_path_env prepends paths and removes duplicates."""
+    import os
+
+    from ansiblelint.app import _update_path_env
+
+    env: dict[str, str] = {"ANSIBLE_LIBRARY": "/existing/path"}
+    paths = ["/new/path", "/existing/path"]
+
+    _update_path_env(env, "ANSIBLE_LIBRARY", paths)
+
+    # Should prepend new paths and deduplicate
+    expected = os.pathsep.join(["/new/path", "/existing/path"])
+    assert env["ANSIBLE_LIBRARY"] == expected
+
+
+def test_update_path_env_empty_paths() -> None:
+    """Verify _update_path_env does nothing when paths is empty."""
+    from ansiblelint.app import _update_path_env
+
+    env: dict[str, str] = {"ANSIBLE_LIBRARY": "/existing/path"}
+    _update_path_env(env, "ANSIBLE_LIBRARY", [])
+
+    assert env["ANSIBLE_LIBRARY"] == "/existing/path"
+
+
+def test_update_path_env_no_existing_var() -> None:
+    """Verify _update_path_env works when env var doesn't exist."""
+    import os
+
+    from ansiblelint.app import _update_path_env
+
+    env: dict[str, str] = {}
+    paths = ["/new/path1", "/new/path2"]
+
+    _update_path_env(env, "ANSIBLE_LIBRARY", paths)
+
+    expected = os.pathsep.join(["/new/path1", "/new/path2"])
+    assert env["ANSIBLE_LIBRARY"] == expected
+
+
+def test_ignore_file_with_skip_and_strict(tmp_path: Path) -> None:
+    """Test that .ansible-lint-ignore with skip qualifier returns exit code 0 with --strict.
+
+    When all violations are skipped using 'skip' in .ansible-lint-ignore,
+    the exit code should be 0, even with --strict flag.
+    """
+    lintable = Lintable(tmp_path / "test.yml")
+    lintable.content = "bad_indentation:\n- blah: plop\n  zz: 42\n"
+    lintable.write(force=True)
+
+    # Create ignore file with skip qualifier
+    ignore_file = tmp_path / ".ansible-lint-ignore"
+    ignore_file.write_text("test.yml yaml[indentation] skip")
+
+    result = run_ansible_lint(lintable.filename, "--strict", cwd=tmp_path)
+
+    # Should return 0 because all violations are skipped
+    assert result.returncode == RC.SUCCESS
+
+
+def test_ignore_file_without_skip_and_strict(tmp_path: Path) -> None:
+    """Test that .ansible-lint-ignore without skip qualifier returns exit code 2 with --strict.
+
+    When violations are ignored (but not skipped) in .ansible-lint-ignore,
+    they should be treated as warnings, and --strict should cause exit code 2.
+    """
+    lintable = Lintable(tmp_path / "test.yml")
+    lintable.content = "bad_indentation:\n- blah: plop\n  zz: 42\n"
+    lintable.write(force=True)
+
+    # Create ignore file without skip qualifier
+    ignore_file = tmp_path / ".ansible-lint-ignore"
+    ignore_file.write_text("test.yml yaml[indentation]")
+
+    result = run_ansible_lint(lintable.filename, "--strict", cwd=tmp_path)
+
+    # Should return 2 because there's a warning and we're in strict mode
+    assert result.returncode == RC.VIOLATIONS_FOUND
+
+
+def test_rule_is_skipped_checks_all_ignore_rules() -> None:
+    """Validate that skip qualifier lookup does not stop at an unrelated rule."""
+    rules = (
+        IgnoreRule("yaml[truthy]", frozenset()),
+        IgnoreRule("yaml[indentation]", frozenset({IgnoreRuleQualifier.SKIP})),
+    )
+
+    assert _rule_is_skipped("yaml[indentation]", rules)
+
+
+def test_skip_list_and_strict(tmp_path: Path) -> None:
+    """Test that skip_list returns exit code 0 with --strict.
+
+    When all rules generating violations are skipped using 'skip_list',
+    the exit code should be 0, even with --strict flag.
+    """
+    lintable = Lintable(tmp_path / "test.yml")
+    lintable.content = "bad_indentation:\n- blah: plop\n  zz: 42\n"
+    lintable.write(force=True)
+
+    # Create config file with skip_list
+    config_file = tmp_path / ".ansible-lint"
+    config_file.write_text("skip_list:\n  - yaml[indentation]\n")
+
+    result = run_ansible_lint(lintable.filename, "--strict", cwd=tmp_path)
+
+    # Should return 0 because rule is in skip_list
+    assert result.returncode == RC.SUCCESS
+
+
+def test_ensure_cache_collections_first_noop_without_cache_dir() -> None:
+    """Ensure helper is a no-op when cache_dir is not set."""
+    from unittest.mock import MagicMock
+
+    from ansiblelint.app import _ensure_cache_collections_first
+
+    app = MagicMock()
+    app.runtime.cache_dir = None
+    app.runtime.config.collections_paths = ["/some/path"]
+
+    _ensure_cache_collections_first(app)
+
+    assert app.runtime.config.collections_paths == ["/some/path"]
+
+
+def test_get_app_prepends_cache_collections_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ensure runtime cache directory is prepended to collections_paths when external paths exist."""
+    from unittest.mock import patch
+
+    from ansiblelint.app import get_app
+    from ansiblelint.config import options as default_options
+
+    external_path = "/usr/share/ansible/collections"
+    monkeypatch.setattr(default_options, "cache_dir", tmp_path / ".ansible")
+    monkeypatch.setenv("ANSIBLE_COLLECTIONS_PATH", external_path)
+
+    with patch("ansible_compat.runtime.Runtime.prepare_environment"):
+        app = get_app(offline=True)
+
+    expected_cache_target = str(app.runtime.cache_dir / "collections")
+    assert app.runtime.config.collections_paths[0] == expected_cache_target
+    assert external_path in app.runtime.config.collections_paths
+
+
+def test_get_app_prepends_cache_dir_without_external_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ensure cache dir is prepended exactly once even without external collections path."""
+    from unittest.mock import patch
+
+    from ansiblelint.app import get_app
+    from ansiblelint.config import options as default_options
+
+    monkeypatch.setattr(default_options, "cache_dir", tmp_path / ".ansible")
+    monkeypatch.delenv("ANSIBLE_COLLECTIONS_PATH", raising=False)
+
+    with patch("ansible_compat.runtime.Runtime.prepare_environment"):
+        app = get_app(offline=True)
+
+    assert app.runtime.config.collections_paths is not None
+    cache_target = str(app.runtime.cache_dir / "collections")
+    assert app.runtime.config.collections_paths[0] == cache_target
+    assert app.runtime.config.collections_paths.count(cache_target) == 1
+
+
+def test_get_app_moves_existing_cache_dir_to_front(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ensure cache dir is moved to index 0 when it already exists at a later position."""
+    from unittest.mock import patch
+
+    from ansiblelint.app import get_app
+    from ansiblelint.config import options as default_options
+
+    external_path = "/usr/share/ansible/collections"
+    monkeypatch.setattr(default_options, "cache_dir", tmp_path / ".ansible")
+    monkeypatch.setenv("ANSIBLE_COLLECTIONS_PATH", external_path)
+
+    with patch("ansible_compat.runtime.Runtime.prepare_environment"):
+        app = get_app(offline=True)
+
+    cache_target = str(app.runtime.cache_dir / "collections")
+    assert app.runtime.config.collections_paths[0] == cache_target
+    assert app.runtime.config.collections_paths.count(cache_target) == 1
